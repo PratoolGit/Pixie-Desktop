@@ -9,7 +9,7 @@
   "scripts": {
     "postinstall": "node scripts/fetch-vision.js",
     "start": "electron .",
-    "dist": "electron-builder --win nsis,zip --x64 --publish never",
+    "dist": "electron-builder --win nsis zip --x64 --publish never",
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "0.10.14"
