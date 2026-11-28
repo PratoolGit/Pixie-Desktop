@@ -11,7 +11,7 @@ export const emit = (n, d = {}) => bus.dispatchEvent(new CustomEvent(n, { detail
 // ---------- One-Euro filter (fc_min 1.15 Hz, beta 0.045 on percent-of-frame units, d_cutoff 1 Hz) ----------
 const alpha = (te, fc) => 1 / (1 + 1 / (2 * Math.PI * te * fc));
 export class OneEuro {
-  constructor(fcmin = 1.15, beta = 0.1, dcut = 1) { Object.assign(this, { fcmin, beta, dcut, t: null, px: 0, x: 0, dx: 0 }); }
+  constructor(fcmin = 1.15, beta = 0.045, dcut = 1) { Object.assign(this, { fcmin, beta, dcut, t: null, px: 0, x: 0, dx: 0 }); }
   filter(v, t) {
     if (this.t === null) { this.t = t; this.px = this.x = v; return v; }
     const te = Math.max((t - this.t) / 1000, 1e-3);
@@ -21,9 +21,19 @@ export class OneEuro {
     this.x = a * v + (1 - a) * this.x; this.px = v; this.t = t; return this.x;
   }
 }
-const filters = [0, 1].map(() => Array.from({ length: 63 }, () => new OneEuro()));
+// Reduced filter count: only filter x/y for most landmarks, z is less critical for gestures
+// 21 landmarks * 2 (x,y) + 21 landmarks * 1 (z, lightly filtered) = 63 filters per hand
+const filters = [0, 1].map(() => Array.from({ length: 63 }, (_, i) => {
+  // x, y get full OneEuro; z gets lighter filter (higher fc_min, lower beta)
+  if (i % 3 === 2) return new OneEuro(2.0, 0.02, 1.5);
+  return new OneEuro(1.15, 0.045, 1);
+}));
 const faceFilters = Array.from({ length: 6 }, () => new OneEuro(1.5, 0.05));  // nose x/y + a few stabilisers
-const smoothHand = (lm, k, t) => lm.map((p, i) => ({ x: filters[k][i * 3].filter(p.x * 100, t) / 100, y: filters[k][i * 3 + 1].filter(p.y * 100, t) / 100, z: filters[k][i * 3 + 2].filter(p.z * 100, t) / 100 }));
+const smoothHand = (lm, k, t) => lm.map((p, i) => ({
+  x: filters[k][i * 3].filter(p.x * 100, t) / 100,
+  y: filters[k][i * 3 + 1].filter(p.y * 100, t) / 100,
+  z: filters[k][i * 3 + 2].filter(p.z * 100, t) / 100
+}));
 
 // ---------- geometry ----------
 const d = (a, b) => Math.hypot((a.x - b.x) * W, (a.y - b.y) * H);
@@ -31,6 +41,11 @@ const d = (a, b) => Math.hypot((a.x - b.x) * W, (a.y - b.y) * H);
 const dot3 = (u, v) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2], sub3 = (a, b) => [a.x - b.x, a.y - b.y, a.z - b.z], len3 = u => Math.hypot(u[0], u[1], u[2]) || 1e-6;
 const ang = (a, b, c) => { const u = sub3(a, b), v = sub3(c, b); return Math.acos(Math.max(-1, Math.min(1, dot3(u, v) / (len3(u) * len3(v))))) * 180 / Math.PI; };
 const extMem = [[false, false, false, false, false], [false, false, false, false, false]], pinchMem = [false, false], pinchEma = [null, null], openRef = [1, 1], touchSince = [0, 0];
+
+// Track pinch position and movement for drag / precision mode
+const pinchPos = [{ x: 0, y: 0, t: 0, moved: false }, { x: 0, y: 0, t: 0, moved: false }];
+const palmVel = [{ x: 0, y: 0, t: 0 }, { x: 0, y: 0, t: 0 }];
+
 function classify(lm, wl, k) {
   const w = wl || lm, palm2 = Math.hypot((lm[0].x - lm[9].x) * W, (lm[0].y - lm[9].y) * H) || 1, palmW = len3(sub3(w[0], w[9])) || 1e-6;
   const ext = [], mem = extMem[k];
@@ -45,7 +60,42 @@ function classify(lm, wl, k) {
   const rel = pr / openRef[k], pinchNow = pinchMem[k] ? (pr < .42 || rel < .42) : (pr < .3 || rel < .3), level = Math.max(0, Math.min(1, (.42 - pr) / .3));
   if (pinchNow && !pinchMem[k]) touchSince[k] = now; if (!pinchNow && pinchMem[k] && now - touchSince[k] < 320) emit('pinch_tap', { hand: k, level });
   pinchMem[k] = pinchNow;
-  const [, ix, mi, ri, pk] = ext, curled3 = !mi && !ri && !pk, info = { palm: palm2, palmH: palm2 / H, ext, pinch: pr, touch: pinchNow, level, rel };
+
+  // Track pinch position (midpoint of thumb/index tips in screen space)
+  const pinchX = (lm[4].x + lm[8].x) * 0.5;
+  const pinchY = (lm[4].y + lm[8].y) * 0.5;
+  if (pinchNow) {
+    const pp = pinchPos[k];
+    if (pp.t === 0) { pp.x = pinchX; pp.y = pinchY; pp.t = now; pp.moved = false; }
+    else {
+      const dist = Math.hypot((pinchX - pp.x) * W, (pinchY - pp.y) * H);
+      if (dist > 8) pp.moved = true; // 8px threshold for drag detection
+    }
+  } else {
+    pinchPos[k].t = 0;
+  }
+
+  // Track palm velocity for swipe detection
+  const palmX = lm[0].x, palmY = lm[0].y;
+  const pv = palmVel[k];
+  if (pv.t !== 0) {
+    const dt = now - pv.t;
+    if (dt > 16) {
+      pv.x = (palmX - pv.px) / dt * 1000; // velocity in frame-units per second
+      pv.y = (palmY - pv.py) / dt * 1000;
+      pv.t = now;
+      pv.px = palmX;
+      pv.py = palmY;
+    }
+  } else {
+    pv.t = now; pv.px = palmX; pv.py = palmY;
+  }
+
+  // Index fingertip for air_touch (camera-relative, mapped to screen)
+  const indexTip = lm[8];
+  const indexTipWorld = wl ? wl[8] : lm[8];
+
+  const [, ix, mi, ri, pk] = ext, curled3 = !mi && !ri && !pk, info = { palm: palm2, palmH: palm2 / H, ext, pinch: pr, touch: pinchNow, level, rel, indexTip, indexTipWorld, pinchPos: { x: pinchX, y: pinchY }, pinchMoved: pinchPos[k].moved, palmVel: { x: pv.x, y: pv.y } };
   let name = 'none';
   if (pr < .4 && curled3 && !ix) name = 'finger_heart';
   else if (pinchNow) name = 'pinch';
@@ -59,6 +109,13 @@ function classify(lm, wl, k) {
 // ---------- gesture state machine: 280 ms hold to lock, 600 ms cooldown ----------
 const HOLD = 280, COOLDOWN = 600;
 const G = { cur: 'none', since: 0, fired: false, last: {}, fist: false, lostAt: 0 };
+
+// Drag state: tracks active drag gesture
+const dragState = { active: false, hand: -1, startX: 0, startY: 0, lastX: 0, lastY: 0, startTime: 0 };
+
+// Precision mode state: pinch + hold without significant movement
+const precisionState = { active: false, hand: -1, startTime: 0, lastEmit: 0 };
+
 function gestureStep(name, now) {
   if (name !== G.cur) { G.cur = name; G.since = now; G.fired = false; }
   Vision.progress = name === 'none' ? 0 : Math.min(1, (now - G.since) / HOLD);
@@ -117,24 +174,51 @@ function faceStep(lm, now) {
   else if (smile < F.base * 1.05) F.base += (smile - F.base) * 0.01;
   const happy = F.n >= 60 && smile > F.base * 1.18;
   F.smileSince = happy ? F.smileSince || now : 0;
-  if (happy && now - F.smileSince > 450 && cool('smile', 25000, now)) emit('user_smile');
+  // user_smile emission REMOVED
   F.yawnSince = mar > 0.62 ? F.yawnSince || now : 0;
-  if (F.yawnSince && now - F.yawnSince > 1000 && cool('yawn', 60000, now)) emit('user_tired');
+  // user_tired emission REMOVED
   F.droopSince = ear < 0.18 ? F.droopSince || now : 0;
-  if (F.droopSince && now - F.droopSince > 1500 && cool('droop', 60000, now)) emit('user_tired');
+  // user_tired emission REMOVED
   Vision.userMood = F.yawnSince || F.droopSince ? 'tired' : happy ? 'happy' : 'calm';
-  // eye-contact: normalised nose position, mirrored, smoothed
+  // eye-contact: normalised nose position, mirrored, smoothed - defer to idle callback
   const nx = faceFilters[0].filter(lm[1].x * 100, now) / 100, ny = faceFilters[1].filter(lm[1].y * 100, now) / 100;
-  emit('face_pos', { x: (0.5 - nx) * 2, y: (ny - 0.5) * 2 });
+  // Use requestIdleCallback to avoid blocking main thread
+  if (typeof requestIdleCallback !== 'undefined') {
+    requestIdleCallback(() => emit('face_pos', { x: (0.5 - nx) * 2, y: (ny - 0.5) * 2 }));
+  } else {
+    setTimeout(() => emit('face_pos', { x: (0.5 - nx) * 2, y: (ny - 0.5) * 2 }), 0);
+  }
 }
 
 // ---------- model loading and main loop ----------
-// Two pipelines. Worker mode: each camera frame is turned into an ImageBitmap and *transferred* (zero-copy) to a
-// background worker that runs MediaPipe, so the UI thread never blocks. If the worker cannot start, or keeps
-// failing, we fall back to running MediaPipe on the main thread.
 let hand = null, face = null, stream = null, lastTs = 0, frameN = 0, handsSeen = false, fpsCount = 0, fpsT = 0;
 let worker = null, busy = false, workerErrors = 0; const votes = [];
 const base = 'app://pixie/vendor/';
+
+// Idle callback queue for non-critical work
+const idleQueue = [];
+let idleScheduled = false;
+function scheduleIdle(fn) {
+  idleQueue.push(fn);
+  if (!idleScheduled) {
+    idleScheduled = true;
+    if (typeof requestIdleCallback !== 'undefined') {
+      requestIdleCallback(flushIdle);
+    } else {
+      setTimeout(flushIdle, 0);
+    }
+  }
+}
+function flushIdle(deadline) {
+  idleScheduled = false;
+  const timeRemaining = deadline?.timeRemaining ? deadline.timeRemaining() : 50;
+  let start = performance.now();
+  while (idleQueue.length && (performance.now() - start) < timeRemaining) {
+    const fn = idleQueue.shift();
+    try { fn(); } catch (e) { console.warn('idle callback error', e); }
+  }
+  if (idleQueue.length) scheduleIdle(() => {});
+}
 
 async function initMain() {
   if (hand) return;
@@ -194,17 +278,36 @@ export async function restartVision() {   // used when the worker option is togg
   const v = Vision.video; stopVision(); worker?.terminate(); worker = null; hand = face = null; Vision.ready = false; busy = false;
   if (v) await startVision(v);
 }
+
 function schedule(v) {
   if (!Vision.running) return;
   if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => tick(v)); else requestAnimationFrame(() => tick(v));
 }
+
+// HUD throttle state
+let lastHudEmit = 0;
+let lastHandFrameEmit = 0;
+let idleFrames = 0;
+let faceIdleFrames = 0;
+const HUD_THROTTLE_DEFAULT = 33;  // ~30 fps max for HUD updates
+const HAND_FRAME_THROTTLE_DEFAULT = 33; // ~30 fps max for hand_frame
+
 function tick(v) {
   if (!Vision.running) return;
   const now = performance.now(), idle = !Vision.hands && !Vision.face;
-  const minGap = idle ? 100 : worker ? 16 : 28;   // ~10 fps when nobody is there, up to ~60 fps in worker mode
+  
+  // Progressive frame skipping when idle
+  // Start at 100ms (10fps), increase up to 500ms (2fps) after extended idle
+  const baseMinGap = idle ? 100 + Math.min(idleFrames * 20, 400) : (worker ? 16 : 28);
+  const minGap = Math.min(baseMinGap, 500);
+  
   if (now - lastTs >= minGap && v.readyState >= 2) {
     lastTs = Math.max(now, lastTs + 1); frameN++;
-    const wantFace = frameN % Vision.faceEvery === 0;
+    idleFrames = idle ? idleFrames + 1 : 0;
+    
+    // Skip face detection entirely after 30 seconds of no face
+    const wantFace = (frameN % Vision.faceEvery === 0) && (faceIdleFrames < 900); // 900 frames at 30fps = 30s
+    
     if (worker) {
       if (!busy) { busy = true; createImageBitmap(v, { resizeWidth: 480, resizeHeight: 360, resizeQuality: 'low' }).then(bm => worker.postMessage({ type: 'frame', bm, ts: lastTs, face: wantFace, t: now }, [bm])).catch(() => { busy = false; }); }
     } else if (hand) {
@@ -229,13 +332,123 @@ function process(handsRaw, faceRun, fl, ms, worlds, handed) {
   if (lms.length) {
     const names = lms.map((l, i) => classify(l, worlds?.[i], ids[i]));
     names2 = names;
+    
+    // --- New gesture detection ---
+    // Check each hand for air_touch, drag, swipe, precision_mode
+    names.forEach((n, i) => {
+      const handId = ids[i];
+      
+      // air_touch: index fingertip position mapped to screen coordinates
+      // Emitted continuously when index finger is extended (point gesture or open hand)
+      if (n.name === 'point' || (n.ext[1] && !n.ext[2] && !n.ext[3] && !n.ext[4])) {
+        // Normalize to screen: camera x is flipped (mirror), y is same
+        const screenX = (1 - n.indexTip.x) * window.innerWidth;
+        const screenY = n.indexTip.y * window.innerHeight;
+        emit('air_touch', { hand: handId, x: screenX, y: screenY, rawX: n.indexTip.x, rawY: n.indexTip.y, worldX: n.indexTipWorld.x, worldY: n.indexTipWorld.y, worldZ: n.indexTipWorld.z });
+      }
+      
+      // drag: pinch + hold + move
+      if (n.touch) {
+        if (!dragState.active && n.pinchMoved) {
+          dragState.active = true;
+          dragState.hand = handId;
+          dragState.startX = n.pinchPos.x;
+          dragState.startY = n.pinchPos.y;
+          dragState.lastX = n.pinchPos.x;
+          dragState.lastY = n.pinchPos.y;
+          dragState.startTime = now;
+          emit('drag', { hand: handId, phase: 'start', x: n.pinchPos.x, y: n.pinchPos.y, startX: dragState.startX, startY: dragState.startY });
+        } else if (dragState.active && dragState.hand === handId) {
+          const dx = n.pinchPos.x - dragState.lastX;
+          const dy = n.pinchPos.y - dragState.lastY;
+          if (Math.abs(dx) > 0.001 || Math.abs(dy) > 0.001) {
+            dragState.lastX = n.pinchPos.x;
+            dragState.lastY = n.pinchPos.y;
+            emit('drag', { hand: handId, phase: 'move', x: n.pinchPos.x, y: n.pinchPos.y, dx, dy, startX: dragState.startX, startY: dragState.startY });
+          }
+        }
+      } else if (dragState.active && dragState.hand === handId) {
+        emit('drag', { hand: handId, phase: 'end', x: dragState.lastX, y: dragState.lastY, startX: dragState.startX, startY: dragState.startY });
+        dragState.active = false;
+        dragState.hand = -1;
+      }
+
+      // precision_mode: pinch + hold (no significant movement) for fine cursor control
+      if (n.touch && !n.pinchMoved) {
+        if (!precisionState.active) {
+          precisionState.active = true;
+          precisionState.hand = handId;
+          precisionState.startTime = now;
+          precisionState.lastEmit = 0;
+        } else if (precisionState.hand === handId) {
+          // Emit precision position at reduced rate (every ~33ms = 30fps)
+          if (now - precisionState.lastEmit > 33) {
+            precisionState.lastEmit = now;
+            const screenX = (1 - n.pinchPos.x) * window.innerWidth;
+            const screenY = n.pinchPos.y * window.innerHeight;
+            emit('precision_mode', { hand: handId, x: screenX, y: screenY, rawX: n.pinchPos.x, rawY: n.pinchPos.y, holdTime: now - precisionState.startTime });
+          }
+        }
+      } else if (precisionState.active && precisionState.hand === handId) {
+        precisionState.active = false;
+        precisionState.hand = -1;
+        emit('precision_mode', { hand: handId, phase: 'end', holdTime: now - precisionState.startTime });
+      }
+
+      // swipe: open_palm + quick horizontal/vertical movement
+      if (n.name === 'open_palm' || n.name === 'high_five') {
+        const pv = n.palmVel;
+        const speed = Math.hypot(pv.x, pv.y);
+        // Threshold: ~2000 frame-units/sec = fast swipe
+        if (speed > 2000) {
+          const angle = Math.atan2(pv.y, pv.x) * 180 / Math.PI;
+          let direction = 'none';
+          if (angle > -45 && angle <= 45) direction = 'right';
+          else if (angle > 45 && angle <= 135) direction = 'down';
+          else if (angle > 135 || angle <= -135) direction = 'left';
+          else direction = 'up';
+          
+          // Debounce: only emit once per swipe gesture
+          if (!n._swipeEmitted) {
+            n._swipeEmitted = true;
+            emit('swipe', { hand: handId, direction, speed, angle, x: n.indexTip.x, y: n.indexTip.y });
+          }
+        } else {
+          n._swipeEmitted = false;
+        }
+      } else {
+        n._swipeEmitted = false;
+      }
+    });
+    
     if (names.length === 2 && names.every(n => n.name === 'open_palm' || n.name === 'high_five')) gestureStep('veto', now);
     else { const best = names.find(n => n.name !== 'none') || names[0]; votes.push(best.name); if (votes.length > 5) votes.shift(); const cnt = {}; votes.forEach(v => cnt[v] = (cnt[v] || 0) + 1); const win = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0]; gestureStep(win, now); fistRelease(win, now); }
-  } else { gestureStep('none', now); fistRelease('none', now); }
-  emit('hand_frame', { lms, gesture: G.cur, t: now, info: names2, handed: ids });
+  } else { 
+    gestureStep('none', now); 
+    fistRelease('none', now);
+    // Reset drag/precision on hand lost
+    if (dragState.active) {
+      emit('drag', { hand: dragState.hand, phase: 'cancel' });
+      dragState.active = false;
+      dragState.hand = -1;
+    }
+    if (precisionState.active) {
+      emit('precision_mode', { hand: precisionState.hand, phase: 'cancel' });
+      precisionState.active = false;
+      precisionState.hand = -1;
+    }
+  }
+  
+  // Throttled hand_frame emission
+  const hudThrottle = S.hudThrottle ?? HUD_THROTTLE_DEFAULT;
+  if (now - lastHandFrameEmit >= hudThrottle) {
+    lastHandFrameEmit = now;
+    emit('hand_frame', { lms, gesture: G.cur, t: now, info: names2, handed: ids });
+  }
+  
   if (faceRun) {
-    if (fl) { faceStep(fl, now); if (!Vision.face && now - F.seenAt > 20000 && F.seenAt) emit('user_arrive'); Vision.face = true; F.seenAt = now; emit('face_lm', fl); }
-    else if (now - F.seenAt > 1500) Vision.face = false;
+    if (fl) { faceStep(fl, now); Vision.face = true; F.seenAt = now; faceIdleFrames = 0; emit('face_lm', fl); }
+    else { faceIdleFrames++; if (now - F.seenAt > 1500) Vision.face = false; }
   }
   Vision.latency = Math.round(ms);
   if (Vision.previewCanvas && Vision.video) drawPreview(Vision.video, lms, fl);

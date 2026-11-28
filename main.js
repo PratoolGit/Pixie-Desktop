@@ -65,7 +65,6 @@ function hideIsland() { islandActive = false; if (island) island.hide(); broadca
 const lock = app.requestSingleInstanceLock();
 if (!lock) app.quit();
 app.on('second-instance', () => { if (main) { if (main.isMinimized()) main.restore(); main.focus(); } });
-
 app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   protocol.handle('app', async req => {
@@ -200,7 +199,7 @@ for (let i = 1; i <= 12; i++) SPECIAL['f' + i] = `{F${i}}`;
 function toSendKeys(combo) {
   const parts = String(combo).toLowerCase().split('+').map(x => x.trim()).filter(Boolean); const key = parts.pop(); let pre = '';
   for (const m of parts) { if (m === 'ctrl' || m === 'control') pre += '^'; else if (m === 'alt') pre += '%'; else if (m === 'shift') pre += '+'; else return null; }
-  const k = SPECIAL[key] || (/^[a-z0-9=\-]$/.test(key) ? key : null); return k ? pre + k : null;
+  const k = SPECIAL[key] || (/^[a-z0-9=\\-]$/.test(key) ? key : null); return k ? pre + k : null;
 }
 
 // ---------- persistent PowerShell host: compiled once, then every task is a ~10 ms message instead of a new process ----------
@@ -275,6 +274,56 @@ while(($line=[Console]::In.ReadLine()) -ne $null){
           'battery' { $b=Get-CimInstance Win32_Battery; if($b){ $res=@{ok=$true;pct=[int]$b.EstimatedChargeRemaining;charging=($b.BatteryStatus -eq 2)} } else { $res=@{ok=$true;pct=$null} } }
         }
       }
+      'create_file' {
+        $p=$a.path; if(-not $p){ $res=@{ok=$false;error='no path'}; break }
+        try{ $dir=[System.IO.Path]::GetDirectoryName($p); if($dir -and -not (Test-Path $dir)){ New-Item -ItemType Directory -Path $dir -Force|Out-Null }; New-Item -ItemType File -Path $p -Force|Out-Null; $res=@{ok=$true} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'read_file' {
+        $p=$a.path; if(-not (Test-Path $p)){ $res=@{ok=$false;error='file not found'}; break }
+        try{ $t=[System.IO.File]::ReadAllText($p); $res=@{ok=$true;text=$t} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'write_file' {
+        $p=$a.path; if(-not $p){ $res=@{ok=$false;error='no path'}; break }
+        try{ $dir=[System.IO.Path]::GetDirectoryName($p); if($dir -and -not (Test-Path $dir)){ New-Item -ItemType Directory -Path $dir -Force|Out-Null }; [System.IO.File]::WriteAllText($p, $a.text); $res=@{ok=$true} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'delete_file' {
+        $p=$a.path; if(-not (Test-Path $p)){ $res=@{ok=$false;error='file not found'}; break }
+        try{ Remove-Item -Path $p -Force; $res=@{ok=$true} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'list_folder' {
+        $p=$a.path; if(-not $p){ $p=[Environment]::GetFolderPath('Desktop') }
+        if(-not (Test-Path $p)){ $res=@{ok=$false;error='folder not found'}; break }
+        try{ $items=Get-ChildItem -Path $p | Select-Object -First 100 | ForEach-Object { @{name=$_.Name;type=if($_.PSIsContainer){'dir'}else{'file'};size=$_.Length;modified=$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm')} }; $res=@{ok=$true;items=$items} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'run_command' {
+        $cmd=$a.cmd; if(-not $cmd){ $res=@{ok=$false;error='no command'}; break }
+        try{ $p=Start-Process -FilePath 'cmd.exe' -ArgumentList "/c",$cmd -NoNewWindow -PassThru -RedirectStandardOutput -RedirectStandardError; $p.WaitForExit(); $out=$p.StandardOutput.ReadToEnd(); $err=$p.StandardError.ReadToEnd(); $res=@{ok=$true;output=$out;error=$err;exitCode=$p.ExitCode} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'git_status' {
+        $p=$a.path; if(-not $p){ $p='.' }
+        try{ $proc=Start-Process -FilePath 'git' -ArgumentList 'status','--short' -WorkingDirectory $p -NoNewWindow -PassThru -RedirectStandardOutput -RedirectStandardError; $proc.WaitForExit(); $out=$proc.StandardOutput.ReadToEnd(); $res=@{ok=$true;output=$out} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'git_commit' {
+        $p=$a.path; if(-not $p){ $p='.' }
+        try{ $proc=Start-Process -FilePath 'git' -ArgumentList 'commit','-m',$a.message -WorkingDirectory $p -NoNewWindow -PassThru -RedirectStandardOutput -RedirectStandardError; $proc.WaitForExit(); $out=$proc.StandardOutput.ReadToEnd(); $err=$proc.StandardError.ReadToEnd(); $res=@{ok=$true;output=$out;error=$err} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'open_editor' {
+        $p=$a.path; if(-not $p){ $p='.' }
+        try{ Start-Process -FilePath 'code' -ArgumentList $p -NoNewWindow; $res=@{ok=$true} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'view_logs' {
+        $p=$a.path; if(-not (Test-Path $p)){ $res=@{ok=$false;error='file not found'}; break }
+        try{ $t=[System.IO.File]::ReadAllText($p); $res=@{ok=$true;text=$t} }catch{ $res=@{ok=$false;error=[string]$_.Exception.Message} }
+      }
+      'control_light' {
+        $res=@{ok=$false;error='IoT not implemented - requires Home Assistant or similar integration'}
+      }
+      'get_sensor' {
+        $res=@{ok=$false;error='IoT not implemented - requires Home Assistant or similar integration'}
+      }
+      'set_thermostat' {
+        $res=@{ok=$false;error='IoT not implemented - requires Home Assistant or similar integration'}
+      }
     }
   } catch { $res=@{ok=$false;error=[string]$_.Exception.Message} }
   if(-not $nr){ $res['id']=$id; Out-Line $res }
@@ -324,6 +373,32 @@ async function viaHost(name, args) {
     case 'key': { if (KEYS_VK[args.key]) return hostCall('key', { vk: KEYS_VK[args.key] }); const sk = toSendKeys(args.combo); if (!sk) return { ok: false, error: 'bad key combo' }; return hostCall('key', { b64: Buffer.from(sk).toString('base64'), hwnd: args.hwnd }); }
     case 'paste': { clipboard.writeText(String(args.text || '')); let r = await hostCall('key', { b64: Buffer.from('^v').toString('base64'), hwnd: args.hwnd }); if (r.ok && args.enter) r = await hostCall('key', { b64: Buffer.from('{ENTER}').toString('base64') }); return r; }
     case 'selection': { const before = clipboard.readText(); clipboard.writeText(''); const r = await hostCall('key', { b64: Buffer.from('^c').toString('base64'), hwnd: args.hwnd }); if (r.hostFail) return r; await new Promise(z => setTimeout(z, 120)); const text = clipboard.readText(); if (!text) clipboard.writeText(before); return { ok: !!text, text, error: text ? undefined : 'nothing selected' }; }
+    // NEW: System & Window Management
+    case 'minimize_window': return hostCall('window', { act: 'min', title: args.title });
+    case 'maximize_window': return hostCall('window', { act: 'max', title: args.title });
+    case 'restore_window': return hostCall('window', { act: 'restore', title: args.title });
+    case 'close_window': return hostCall('window', { act: 'close', title: args.title });
+    case 'list_windows': {
+      const r = await hostCall('scan', { focus: false }, 25000);
+      if (!r.ok) return r;
+      return { ok: true, windows: (r.els || []).map(e => ({ title: e.n, type: e.t, x: e.x, y: e.y, w: e.w, h: e.h })) };
+    }
+    // NEW: File Operations
+    case 'create_file': return hostCall('create_file', { path: args.path });
+    case 'read_file': return hostCall('read_file', { path: args.path });
+    case 'write_file': return hostCall('write_file', { path: args.path, text: args.text });
+    case 'delete_file': return hostCall('delete_file', { path: args.path });
+    case 'list_folder': return hostCall('list_folder', { path: args.path || 'desktop' });
+    // NEW: Development
+    case 'run_command': return hostCall('run_command', { cmd: args.cmd });
+    case 'git_status': return hostCall('git_status', { path: args.path || '.' });
+    case 'git_commit': return hostCall('git_commit', { message: args.message, path: args.path || '.' });
+    case 'open_editor': return hostCall('open_editor', { path: args.path });
+    case 'view_logs': return hostCall('view_logs', { path: args.path });
+    // NEW: Smart Home / IoT (stubbed for now)
+    case 'control_light': return hostCall('control_light', { device: args.device, action: args.action });
+    case 'get_sensor': return hostCall('get_sensor', { device: args.device });
+    case 'set_thermostat': return hostCall('set_thermostat', { temp: args.temp });
     default: return null;
   }
 }
@@ -378,11 +453,75 @@ ipcMain.handle('agent:run', async (_e, { name, args = {} }) => {
       }
       case 'screenshot': { const img = await grabScreen(1920, 1080); const dir = path.join(app.getPath('pictures'), 'Pixie'); fs.mkdirSync(dir, { recursive: true });
         const file = path.join(dir, 'screenshot-' + Date.now() + '.png'); fs.writeFileSync(file, img.toPNG()); shell.showItemInFolder(file); return { ok: true, file }; }
+      // NEW: System & Window Management (non-host fallback)
+      case 'minimize_window': return { ok: false, error: 'minimize_window needs the PowerShell host' };
+      case 'maximize_window': return { ok: false, error: 'maximize_window needs the PowerShell host' };
+      case 'restore_window': return { ok: false, error: 'restore_window needs the PowerShell host' };
+      case 'close_window': return { ok: false, error: 'close_window needs the PowerShell host' };
+      case 'list_windows': return { ok: false, error: 'list_windows needs the PowerShell host' };
+      // NEW: File Operations (non-host fallback)
+      case 'create_file': {
+        const p = args.path; if (!p) return { ok: false, error: 'no path' };
+        try { const dir = path.dirname(p); if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(p, ''); return { ok: true }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      case 'read_file': {
+        const p = args.path; if (!fs.existsSync(p)) return { ok: false, error: 'file not found' };
+        try { const t = fs.readFileSync(p, 'utf8'); return { ok: true, text: t }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      case 'write_file': {
+        const p = args.path; if (!p) return { ok: false, error: 'no path' };
+        try { const dir = path.dirname(p); if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(p, String(args.text || '')); return { ok: true }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      case 'delete_file': {
+        const p = args.path; if (!fs.existsSync(p)) return { ok: false, error: 'file not found' };
+        try { fs.unlinkSync(p); return { ok: true }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      case 'list_folder': {
+        const p = args.path || app.getPath('desktop'); if (!fs.existsSync(p)) return { ok: false, error: 'folder not found' };
+        try { const items = fs.readdirSync(p).slice(0, 100).map(f => { const st = fs.statSync(path.join(p, f)); return { name: f, type: st.isDirectory() ? 'dir' : 'file', size: st.size, modified: st.mtime.toISOString().slice(0, 16).replace('T', ' ') }; }); return { ok: true, items }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      // NEW: Web & Search (handled via net:fetch from renderer)
+      case 'scrape_page': return { ok: false, error: 'scrape_page should use net:fetch from renderer' };
+      case 'extract_links': return { ok: false, error: 'extract_links should use net:fetch from renderer' };
+      case 'summarize_page': return { ok: false, error: 'summarize_page should use net:fetch from renderer' };
+      case 'search_site': await shell.openExternal('https://www.google.com/search?q=site:' + encodeURIComponent(args.site) + '+' + encodeURIComponent(args.query)); return { ok: true };
+      case 'bookmark_page': return { ok: false, error: 'bookmark_page not implemented' };
+      // NEW: Productivity
+      case 'create_calendar_event': return { ok: false, error: 'calendar not implemented' };
+      case 'list_calendar': return { ok: false, error: 'calendar not implemented' };
+      case 'send_email': return { ok: false, error: 'send_email not implemented' };
+      case 'create_todo': return { ok: false, error: 'todos not implemented' };
+      case 'list_todos': return { ok: false, error: 'todos not implemented' };
+      // NEW: Media & Communication
+      case 'play_music': { await shell.openExternal('https://music.youtube.com/search?q=' + encodeURIComponent(args.query)); return { ok: true }; }
+      case 'control_media': return { ok: false, error: 'control_media needs the PowerShell host' };
+      case 'send_message': return { ok: false, error: 'send_message not implemented' };
+      case 'make_call': return { ok: false, error: 'make_call not implemented' };
+      case 'screenshot_region': {
+        const r = args.rect; if (!r) return { ok: false, error: 'no rect' };
+        try { const img = await grabScreen(r.w, r.h, r.x, r.y); const dir = path.join(app.getPath('pictures'), 'Pixie'); fs.mkdirSync(dir, { recursive: true }); const file = path.join(dir, 'screenshot-' + Date.now() + '.png'); fs.writeFileSync(file, img.toPNG()); return { ok: true, file }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+      }
+      // NEW: Development (non-host fallback)
+      case 'run_command': return { ok: false, error: 'run_command needs the PowerShell host' };
+      case 'git_status': return { ok: false, error: 'git_status needs the PowerShell host' };
+      case 'git_commit': return { ok: false, error: 'git_commit needs the PowerShell host' };
+      case 'open_editor': return { ok: false, error: 'open_editor needs the PowerShell host' };
+      case 'view_logs': return { ok: false, error: 'view_logs needs the PowerShell host' };
+      // NEW: Smart Home / IoT
+      case 'control_light': return { ok: false, error: 'IoT not implemented - requires Home Assistant or similar integration' };
+      case 'get_sensor': return { ok: false, error: 'IoT not implemented - requires Home Assistant or similar integration' };
+      case 'set_thermostat': return { ok: false, error: 'IoT not implemented - requires Home Assistant or similar integration' };
+      // NEW: AI-Powered (handled via vision/LLM from renderer)
+      case 'analyze_image': return { ok: false, error: 'analyze_image should use vision from renderer' };
+      case 'generate_code': return { ok: false, error: 'generate_code should use LLM from renderer' };
+      case 'explain_code': return { ok: false, error: 'explain_code should use LLM from renderer' };
+      case 'refactor_code': return { ok: false, error: 'refactor_code should use LLM from renderer' };
+      case 'write_tests': return { ok: false, error: 'write_tests should use LLM from renderer' };
       default: return { ok: false, error: 'unknown action' };
     }
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
 });
-async function grabScreen(w, h) { const src = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: w, height: h } }); if (!src.length) throw new Error('no screen'); return src[0].thumbnail; }
+async function grabScreen(w, h, x = 0, y = 0) { const d = screen.getPrimaryDisplay(), sf = d.scaleFactor || 1; const src = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: Math.round(d.size.width * sf), height: Math.round(d.size.height * sf) } }); if (!src.length) throw new Error('no screen'); let img = src[0].thumbnail; if (x || y || w !== d.size.width || h !== d.size.height) { img = img.crop({ x: Math.round(x * sf), y: Math.round(y * sf), width: Math.round(w * sf), height: Math.round(h * sf) }); } return img; }
 ipcMain.handle('screen:capture', async (_e, o = {}) => {
   try {
     const d = screen.getPrimaryDisplay(), sf = d.scaleFactor || 1, full = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: Math.round(d.size.width * sf), height: Math.round(d.size.height * sf) } });

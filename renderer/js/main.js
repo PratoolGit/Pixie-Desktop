@@ -11,6 +11,9 @@ import { loadFaceID } from './faceid.js';
 import { Chats, loadChats, historyForLLM } from './chats.js';
 import { hasBinding } from './gestures.js';
 import './pointer.js';
+import './swarm.js';
+import { onTask } from './swarm.js';
+
 window.addEventListener('pixie-touch', () => Sound.tick());
 
 const mode = ['island', 'hud'].includes(new URLSearchParams(location.search).get('mode')) ? new URLSearchParams(location.search).get('mode') : 'main';
@@ -32,7 +35,7 @@ Ear.onText = async text => {
   if (awake() || hasPending()) { wakeNow(); dispatchAgentTask(text); } else Ear.onMiss();
 };
 Ear.onStatus = s => setEarStatus(s);
-Ear.onHeard = () => { if (awake() || hasPending()) { Sound.tick(); setEmotion('thinking'); Agent.busy(true); expandIsland(6000); } };   // instant feedback while the words are being recognised
+Ear.onHeard = () => { if (awake() || hasPending()) { Sound.tick(); setEmotion('thinking'); Agent.busy(true); expandIsland(6000); } };
 Ear.onMiss = () => { Agent.busy(false); if (!Voice.speaking) setEmotion('neutral'); };
 async function syncEar() {
   if (active && S.wake) { const ok = await startEar(); if (!ok && Ear.status === 'needs-key' && cool('keyhint', 600000)) say(`I can't hear you yet, ${S.user}. Add a free Groq key in Settings, AI providers, then just say hello Pixie. Until then, type to me below!`, 'pouty', 8000); }
@@ -76,9 +79,67 @@ on('cue', ({ name }) => { if (name === 'head_nod' && hasPending()) resolvePendin
 on('fist_start', () => hooks.ptt());
 on('hand_enter', () => { touch(); expandIsland(4000); });
 on('face_pos', p => { lookAt(p.x, p.y); if (cool('seen', 5000)) touch(); });
-on('user_smile', () => { touch(); react('happy', 5000); Sound.chime(); say(`I love your smile, ${S.user}! It made my day.`, 'happy', 5000); });
-on('user_tired', () => { touch(); react('worried', 6000); say(`${S.user}, you look sleepy! Stretch with me for a minute, okay? I'll count.`, 'worried', 6000); });
-on('user_arrive', () => { if (cool('greet', 60000)) { touch(); react('excited', 3000); say(`Welcome back, ${S.user}! I missed you~`, 'excited', 4000); } });
+
+// --- New gesture handlers ---
+// air_touch: fingertip position mapped to screen coordinates (for hover effects, UI targeting)
+let lastAirTouch = 0;
+on('air_touch', ({ hand, x, y, rawX, rawY, worldX, worldY, worldZ }) => {
+  const now = performance.now();
+  if (now - lastAirTouch < 33) return;
+  lastAirTouch = now;
+  lookAt((x / window.innerWidth) * 2 - 1, (y / window.innerHeight) * 2 - 1);
+});
+
+// drag: pinch + hold + move
+on('drag', ({ hand, phase, x, y, dx, dy, startX, startY }) => {
+  if (phase === 'start') {
+    touch();
+    react('focused', 2000);
+  } else if (phase === 'move') {
+  } else if (phase === 'end') {
+    react('happy', 1500);
+  }
+});
+
+// swipe: open_palm + quick horizontal/vertical movement
+on('swipe', ({ hand, direction, speed, angle, x, y }) => {
+  touch();
+  expandIsland(5000);
+  switch (direction) {
+    case 'left':
+      react('curious', 2000);
+      say(`Swipe left! Going back, ${S.user}~`, 'playful', 3000);
+      break;
+    case 'right':
+      react('excited', 2000);
+      say(`Swipe right! Moving forward~`, 'playful', 3000);
+      break;
+    case 'up':
+      react('idea', 2000);
+      say(`Swipe up! Reaching higher!`, 'idea', 3000);
+      break;
+    case 'down':
+      react('thinking', 2000);
+      say(`Swipe down... bringing it down.`, 'thinking', 3000);
+      break;
+  }
+});
+
+// precision_mode: pinch + hold = cursor control mode (fine cursor movement)
+let precisionActive = false;
+on('precision_mode', ({ hand, x, y, rawX, rawY, holdTime, phase }) => {
+  if (phase === 'end') {
+    precisionActive = false;
+    react('neutral', 1000);
+    return;
+  }
+  if (!precisionActive) {
+    precisionActive = true;
+    touch();
+    react('focused', 5000);
+  }
+});
+
 on('face_verified', () => { Sound.chime(); react('love', 4000); say(`I know that face! Welcome back, ${S.user}. VERIFIED.`, 'happy', 4500); });
 let lastHud = 0;
 on('hand_frame', e => { if (!S.hud) return; const n = performance.now(); if (n - lastHud < 33) return; lastHud = n; window.aether.hudSend({ t: 'hand', hands: e.lms.map(l => l.flatMap(p => [p.x, p.y])) }); });
@@ -86,6 +147,42 @@ on('hand_frame', e => { if (!S.hud) return; const n = performance.now(); if (n -
 // ---------- friendly check-ins ----------
 const CARE = [['Time for a sip of water, ${u}! Staying hydrated helps you shine.', 'happy'], ["You've been at it a while. Let's stretch our shoulders together, ${u}!", 'worried'], ['Quick eye break! Look at something far away for twenty seconds, ${u}.', 'thinking'], ['Proud of how hard you are working today, ${u}! Remember to breathe.', 'proud']];
 let careI = 0; setInterval(() => { if (!active || !S.care || Ear.status === 'off' && !Vision.running) return; if (Voice.speaking || hasPending()) return; const [t, e] = CARE[careI++ % CARE.length]; touch(); react(e, 5000); say(t.replace('${u}', S.user), e, 5000); }, 50 * 60000);
+
+// ---------- swarm task visualization ----------
+onTask('task:start', (e) => {
+  const { name, args } = e.detail;
+  const type = name;
+  let rect = null;
+  let label = type;
+
+  if (args && args.rect) {
+    rect = args.rect;
+  } else if (args && args.target) {
+    const el = document.querySelector(`[data-target="${args.target}"]`);
+    if (el) {
+      rect = { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+    }
+  }
+
+  if (rect) {
+    Swarm.highlight(`task-${type}`, rect, label);
+    Swarm.startSwarm(rect.x + rect.w / 2, rect.y + rect.h / 2, 50);
+  } else {
+    Swarm.startSwarm(innerWidth / 2, innerHeight / 2, 40);
+  }
+});
+
+onTask('task:end', (e) => {
+  const { name, args, success } = e.detail;
+  const type = name;
+
+  Swarm.progressEnd(`task-${type}`);
+  Swarm.unhighlight(`task-${type}`);
+
+  setTimeout(() => {
+    Swarm.stopSwarm();
+  }, 500);
+});
 
 // ---------- boot ----------
 (async () => {

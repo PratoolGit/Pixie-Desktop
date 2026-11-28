@@ -65,7 +65,7 @@ function renderMenu() {
     <tr><td>Summarize / translate / rewrite</td><td>Works on text you highlight (needs AI)</td></tr><tr><td>Screenshot · battery · lock · minimize all</td><td>System helpers</td></tr>
     <tr><td>Fist (hold)</td><td>Wake me instantly</td></tr><tr><td>👍 / both palms</td><td>Yes / stop</td></tr></table>`;
   const lab = `<p class="note">Preview any of her 40 emotions or trigger gestures without a camera.</p><div class="pair"><select id="emoSel">${EMOTIONS.map(e => `<option>${e}</option>`).join('')}</select><button class="btn" data-act="emo">Play</button></div>
-    <div class="btns">${['open_palm', 'finger_heart', 'high_five', 'peace', 'thumbs_up', 'pinch', 'veto'].map(g => `<button class="btn alt" data-act="gesture" data-id="${g}">${g.replace('_', ' ')}</button>`).join('')}<button class="btn alt" data-act="ev" data-id="user_smile">smile</button><button class="btn alt" data-act="ev" data-id="user_tired">yawn</button></div>`;
+    <div class="btns">${['open_palm', 'finger_heart', 'high_five', 'peace', 'thumbs_up', 'pinch', 'veto'].map(g => `<button class="btn alt" data-act="gesture" data-id="${g}">${g.replace('_', ' ')}</button>`).join('')}</div>`;
   menu.innerHTML = `<div class="btns top"><button class="btn alt" data-act="wide">⤢ Studio view</button></div>` + sec('general', 'Character & listening', general, open) + sec('voice', 'Voice (Google TTS)', voice, open) + sec('providers', 'AI providers & API keys', providers, open) +
     sec('routing', 'Task routing', routing, open) + sec('bindings', 'Gesture bindings & recorder', bindingsSection(), open) + sec('face', 'Face ID', faceSection(), open) + sec('macros', 'Macros (offline commands)', macroSection(), open) +
     sec('hud', 'Spatial HUD & performance', hudSection(), open) + sec('lab', 'Test lab', lab, open) + sec('cmds', 'What can I say?', cmds, open);
@@ -170,7 +170,7 @@ function initIsland() {
   $('islandRestore').onclick = () => window.aether.restore();
   el.querySelectorAll('[data-yn]').forEach(b => b.onclick = () => resolvePending(b.dataset.yn === '1'));
   Voice.onStart = () => document.body.classList.add('speaking'); Voice.onEnd = () => document.body.classList.remove('speaking');
-  Agent.busy = on => { if (on) $('islandText').innerHTML = '<span class="dots"><i></i><i></i><i></i></span>'; };
+  Agent.basis = Agent.busy = on => { if (on) $('islandText').innerHTML = '<span class="dots"><i></i><i></i><i></i></span>'; };
   Agent.expand = ms => expandIsland(ms || 6000); Agent.confirmUI = on => { $('islandYN').hidden = !on; if (on) expandIsland(40000); };
   setInterval(() => { const f = focusLeft(); if (f) $('islandText').textContent = `Focus ${String(Math.floor(f / 60)).padStart(2, '0')}:${String(f % 60).padStart(2, '0')}`; }, 1000);
 }

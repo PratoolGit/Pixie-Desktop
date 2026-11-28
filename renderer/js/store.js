@@ -22,6 +22,14 @@ export const VOICES = [
   { id: 'berry', name: 'Berry', desc: 'Sweet British girl', cloud: { name: 'en-GB-Neural2-A', lang: 'en-GB', pitch: 8, rate: 1.08 }, free: { tld: 'co.uk', speed: 1.14 } },
   { id: 'sprinkle', name: 'Sprinkle', desc: 'Cheeky Aussie sparkle', cloud: { name: 'en-AU-Neural2-A', lang: 'en-AU', pitch: 8, rate: 1.1 }, free: { tld: 'com.au', speed: 1.16 } }
 ];
+
+// Hindi and Hinglish language profiles
+export const LANGUAGES = [
+  { id: 'en', name: 'English', native: 'English', script: 'Latin' },
+  { id: 'hi', name: 'Hindi', native: 'हिन्दी', script: 'Devanagari' },
+  { id: 'hinglish', name: 'Hinglish', native: 'हिंग्लिश', script: 'Latin' }
+];
+
 const route = (p, f, f2) => ({ primary: p, fallback: f, fallback2: f2 || { provider: 'offline', model: '' } });
 const off = { provider: 'offline', model: '' };
 export const defaults = () => ({

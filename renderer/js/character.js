@@ -60,7 +60,18 @@ const SPRITES = ['happy', 'sad', 'angry', 'surprised', 'sleepy', 'excited', 'shy
 const url = n => `app://pixie/assets/emotions/${n}.png`;
 SPRITES.forEach(n => { const i = new Image(); i.src = url(n); });
 
-const C = { liveUrl: '', blinkAt: -1, nextBlink: 1500, dbl: false, hairA: 1, prevRot: 0, prevY: 0, vidCur: null, emoChanged: false, mouthOn: false, mouthSprite: '', nod: 0, tilt: 0, tiltT: 0, lastAcc: 0, lastLook: 0, ms: { w: 0, h: 0, c: 0, t: 0 }, name: 'sleeping', shown: '', open: false, openAt: 0, tx: 0, ty: 0, lx: 0, ly: 0, asleep: true, last: Date.now(), timer: null, fxT: [], pop: 0, t0: 0 };
+const C = { liveUrl: '', blinkAt: -1, nextBlink: 1500, dbl: false, hairA: 1, prevRot: 0, prevY: 0, vidCur: null, emoChanged: false, mouthOn: false, mouthSprite: '', nod: 0, tilt: 0, tiltT: 0, lastAcc: 0, lastLook: 0, ms: { w: 0, h: 0, c: 0, t: 0 }, name: 'sleeping', shown: '', open: false, openAt: 0, tx: 0, ty: 0, lx: 0, ly: 0, asleep: true, last: Date.now(), timer: null, fxT: [], pop: 0, t0: 0,
+  // Emotion transition state
+  emoFrom: '', emoTo: '', emoTransStart: 0, emoTransDur: 0,
+  // Gaze/attention
+  gazeTargetX: 0, gazeTargetY: 0, gazeCurrentX: 0, gazeCurrentY: 0, gazeLatency: 100,
+  // Micro-expressions
+  breathPhase: 0, microSaccadeTimer: 0, microSaccadeX: 0, microSaccadeY: 0,
+  // Voice-driven body
+  bodySquash: 1, shoulderBounce: 0, neckTension: 0,
+  // Lip-sync coarticulation
+  prevViseme: 'N', visemeTransition: 0
+};
 const $ = id => document.getElementById(id);
 const chars = () => document.querySelectorAll('img[data-char]');
 
@@ -73,6 +84,12 @@ function showSprite(name, fade) {
 export function setEmotion(name, holdMs = 0) {
   name = norm(name); clearTimeout(C.timer);
   if (name !== C.name) {
+    // Start emotion transition
+    C.emoFrom = C.name;
+    C.emoTo = name;
+    C.emoTransStart = performance.now();
+    C.emoTransDur = getTransitionDuration(C.emoFrom, C.emoTo);
+    
     C.name = name; const e = EM[name]; document.body.dataset.emotion = name; C.open = false; showSprite(e.s, true); C.pop = performance.now(); C.emoChanged = true;
     const ch = $('char'); if (ch) ch.style.setProperty('--f', e.f || 'none');
     const pr = $('prop'); if (pr) { pr.textContent = e.p || ''; pr.classList.remove('in'); void pr.offsetWidth; if (e.p) pr.classList.add('in'); }
@@ -84,6 +101,25 @@ export function setEmotion(name, holdMs = 0) {
 }
 export const emotion = () => C.name;
 export const isAsleep = () => C.asleep;
+
+// Emotion transition durations based on personality - defined here to avoid circular imports
+const TRANSITION_DURATIONS = {
+  'happy->sad': 600, 'sad->happy': 600,
+  'excited->thinking': 400, 'thinking->excited': 400,
+  'neutral->*': 300, '*->neutral': 300,
+  'surprised->*': 250, '*->surprised': 200,
+  'angry->*': 500, '*->angry': 400,
+  'scared->*': 450,
+  'sleepy->*': 800, '*->sleepy': 700,
+  'default': 400
+};
+function getTransitionDuration(from, to) {
+  const key = `${from}->${to}`;
+  const revKey = `${to}->${from}`;
+  const fromWild = `${from}->*`;
+  const toWild = `*->${to}`;
+  return TRANSITION_DURATIONS[key] || TRANSITION_DURATIONS[revKey] || TRANSITION_DURATIONS[fromWild] || TRANSITION_DURATIONS[toWild] || TRANSITION_DURATIONS['default'];
+}
 
 // ---- particles & props ----
 const G = { hearts: ['♥', '♡', '♥'], sparkles: ['✦', '✧', '★'], confetti: ['●', '▲', '■', '✿'], zzz: ['z', 'Z', 'z'], flowers: ['✿', '❀'], notes: ['♪', '♫'], steam: ['☁'], sweat: ['💧'], tears: ['💧'], waves: ['((', '(('] };
@@ -122,30 +158,49 @@ function motion(m, t, lvl) {
     case 'float': return [S(t * a * .6) * 4, S(t * a) * b, S(t * a * .6) * 1.5, 1, 1];
     case 'tremble': return [S(t * 40) * 1.2, S(t * 33) * .8, S(t * .9) * 1.2, 1, 1];
     case 'droop': return [0, 10 + S(t * 1.2) * 2, S(t * .8) * 1.4, 1, .975];
+    case 'breathe': return [0, S(t * .5) * 2, S(t * .7) * .8, 1 + S(t * .5) * .005, 1 + S(t * .5) * .005];
     default: return [S(t * .7) * 1.2, S(t * 2) * 3, S(t * .9) * 1.2, 1, 1 + S(t * 2) * .008];
   }
 }
 export function lookAt(x, y) { C.drift = false; C.lastLook = performance.now(); C.tx = x; C.ty = y; }
 export function touch() { C.last = Date.now(); if (C.asleep) wakeUp(); }
 const IDLE = [['curious', 2400], ['happy', 2200], ['shy', 2000], ['thinking', 2600], ['proud', 2200], ['greeting', 2200]];
+
 // ---- real lip-sync: vector lips shaped by the viseme + loudness from the audio clock, painted on the mouthless original face ----
 const VIS = { N: { w: .92, h: .1 }, M: { w: .86, h: 0 }, A: { w: 1, h: 1, t: 1 }, E: { w: 1.2, h: .52, t: 1 }, I: { w: 1.3, h: .27, t: 1 }, O: { w: .62, h: .85, r: 1 }, U: { w: .46, h: .55, r: 1 }, F: { w: 1.02, h: .15, t: 1 }, L: { w: 1, h: .4, t: 1 }, PREP: { w: .72, h: .12 } };
 const E_ = id => document.getElementById(id);
 const EYES = { confused: [{ x: .365, y: .56, rx: .07, ry: .07 }, { x: .625, y: .53, rx: .075, ry: .07 }], thinking: [{ x: .365, y: .545, rx: .07, ry: .065 }, { x: .62, y: .54, rx: .07, ry: .065 }], surprised: [{ x: .39, y: .545, rx: .075, ry: .078 }, { x: .65, y: .545, rx: .075, ry: .078 }], angry: [{ x: .36, y: .595, rx: .08, ry: .045 }, { x: .635, y: .59, rx: .08, ry: .045 }] };
 let LIVE = null; const VID = {}; const mcv = document.createElement('canvas'), mctx = mcv.getContext('2d');
+
+function getVisemeShape(viseme, lvl) {
+  const v = VIS[viseme] || VIS.N;
+  return { w: v.w * (1 + .07 * lvl), h: v.h * Math.min(1.12, .3 + lvl * .95), r: v.r, t: v.t };
+}
+
 function mouthState(a, now, dt) {
   const W = a.w, H = a.h, hw = a.hw / 100 * W, oh = a.oh / 100 * H, cx = a.cx / 100 * W, cy = a.cy / 100 * H;
-  const prep = Voice.preparing && !Voice.speaking, v = VIS[prep ? 'PREP' : Voice.viseme] || VIS.N, lvl = Voice.speaking ? Voice.level : .3 + .2 * Math.sin(now / 170);
+  const prep = Voice.preparing && !Voice.speaking, viseme = Voice.viseme || 'N', lvl = Voice.speaking ? Voice.level : .3 + .2 * Math.sin(now / 170);
+  
+  // Coarticulation: blend with previous viseme
+  const currShape = getVisemeShape(viseme, lvl);
+  const prevShape = getVisemeShape(C.prevViseme, lvl);
+  const blend = Math.min(1, C.visemeTransition);
+  
+  const blendedW = prevShape.w * (1 - blend) + currShape.w * blend;
+  const blendedH = prevShape.h * (1 - blend) + currShape.h * blend;
+  const hasRound = currShape.r || prevShape.r;
+  const hasTeeth = (currShape.t || prevShape.t) && blendedH > oh * .28;
+  
   const M = C.ms, k = 1 - Math.exp(-dt * 32);
-  const tw = hw * v.w * (1 + .07 * lvl), th = prep ? oh * (.06 + .05 * Math.sin(now / 200)) : oh * v.h * Math.min(1.12, .3 + lvl * .95);
+  const tw = hw * blendedW, th = prep ? oh * (.06 + .05 * Math.sin(now / 200)) : oh * blendedH;
   M.w += (tw - M.w) * k; M.h += (th - M.h) * (th > M.h ? k : k * 1.2); M.c += ((Voice.speaking ? a.c * .45 + .12 : a.c) - M.c) * k; if (!M.w) M.w = hw;
   const w = M.w, h = Math.max(0, M.h), lift = M.c * w * .26, L = [cx - w, cy - lift], R = [cx + w, cy - lift], lw = Math.max(1.3, W * .0068);
-  if (h < oh * .07) return { closed: true, line: `M${L[0]} ${L[1]} Q${cx} ${cy + M.c * w * .55 + w * .08} ${R[0]} ${R[1]}`, lw };
-  const rd = v.r && h > oh * .2; let d;
+  if (h < oh * .07) return { closed: true, line: `M${L[0]} ${L[1]} Q${cx} ${cy + M.c * w * .55 + w * .08} ${R[0]} ${R[1]}`, lw, viseme };
+  const rd = hasRound && h > oh * .2; let d;
   if (rd) { const ey = cy + h * .38, ry = h * .55; d = `M${cx - w} ${ey} A${w} ${ry} 0 1 0 ${cx + w} ${ey} A${w} ${ry} 0 1 0 ${cx - w} ${ey}Z`; }
   else d = `M${L[0]} ${L[1]} Q${cx} ${L[1] - w * .06 - h * .08} ${R[0]} ${R[1]} Q${cx} ${R[1] + h * 1.38} ${L[0]} ${L[1]}Z`;
   const top = rd ? cy + h * .38 - h * .55 : L[1];
-  return { closed: false, d, lw, tongue: { cx, cy: rd ? cy + h * .62 : L[1] + h * .78, rx: w * (rd ? .6 : .56), ry: Math.max(.5, h * .3) }, teeth: v.t && h > oh * .28 ? { x: cx - w * .78, y: top - 1, w: w * 1.56, h: Math.min(h * .26, oh * .24) } : null };
+  return { closed: false, d, lw, tongue: { cx, cy: rd ? cy + h * .62 : L[1] + h * .78, rx: w * (rd ? .6 : .56), ry: Math.max(.5, h * .3) }, teeth: hasTeeth ? { x: cx - w * .78, y: top - 1, w: w * 1.56, h: Math.min(h * .26, oh * .24) } : null, viseme };
 }
 function paintMouth(s) {
   mctx.clearRect(0, 0, mcv.width, mcv.height); mctx.lineJoin = mctx.lineCap = 'round'; mctx.lineWidth = s.lw; mctx.strokeStyle = '#74404c';
@@ -166,6 +221,30 @@ function setMouthLayer(on, name) {   // DOM fallback only
   else { m.style.opacity = 0; svg.style.opacity = 0; C.mouthOn = false; }
 }
 const blinkVal = now => { if (now > C.nextBlink && C.blinkAt < 0) { C.blinkAt = now; C.nextBlink = now + 2400 + Math.random() * 2600; C.dbl = Math.random() < .15; } if (C.blinkAt < 0) return 0; const ph = (now - C.blinkAt) / 150; if (ph >= 1) { if (C.dbl) { C.dbl = false; C.blinkAt = now + 90; } else C.blinkAt = -1; return 0; } return ph >= 0 ? Math.sin(ph * Math.PI) : 0; };
+
+// Gaze/attention system with smooth pursuit
+function updateGaze(now, dt) {
+  // Smooth pursuit toward gaze target with ~100ms latency
+  const alpha = 1 - Math.exp(-dt * 10); // ~100ms time constant
+  C.gazeCurrentX += (C.gazeTargetX - C.gazeCurrentX) * alpha;
+  C.gazeCurrentY += (C.gazeTargetY - C.gazeCurrentY) * alpha;
+  
+  // Micro-saccades - tiny random eye movements during fixation
+  C.microSaccadeTimer -= dt * 1000;
+  if (C.microSaccadeTimer <= 0) {
+    C.microSaccadeTimer = 150 + Math.random() * 400; // 150-550ms between saccades
+    C.microSaccadeX = (Math.random() - .5) * .03;
+    C.microSaccadeY = (Math.random() - .5) * .02;
+  }
+  
+  // Apply micro-saccades with decay
+  const saccadeDecay = Math.exp(-dt * 8);
+  C.microSaccadeX *= saccadeDecay;
+  C.microSaccadeY *= saccadeDecay;
+  
+  return { x: C.gazeCurrentX + C.microSaccadeX, y: C.gazeCurrentY + C.microSaccadeY };
+}
+
 // optional real video loops: assets/anim/<emotion or drawing name>.webm|.mp4 replace the still image for that emotion
 async function probeVideos() {
   for (const n of new Set([...Object.keys(EM), ...SPRITES])) for (const ext of ['webm', 'mp4']) {
@@ -179,16 +258,44 @@ export function startLoop() {
   if ($('sprM')) probeVideos();
   const loop = now => {
     const dt = Math.min(.05, (now - prev) / 1000); prev = now; const t = now / 1000, e = EM[C.name]; Voice.sample();
+    
+    // Update gaze/attention
+    const gaze = updateGaze(now, dt);
+    
     if (now - C.lastLook > 3500) { C.lastLook = now; if (Math.abs(C.tx) < .05 && Math.abs(C.ty) < .05 || C.drift) { C.drift = true; C.tx = (Math.random() - .5) * .5; C.ty = (Math.random() - .5) * .25; } }
     C.lx += (C.tx - C.lx) * .08; C.ly += (C.ty - C.ly) * .08;
     const speaking = Voice.speaking, prepare = Voice.preparing && !speaking, lvl = speaking ? Voice.level : 0;
     let [x, y, r, sx, sy] = motion(e.m, t, lvl);
     const age = now - C.pop; if (age < 420) { const k = age / 420, pop = 1 + Math.sin(k * Math.PI) * .07 * (1 - k); sx *= pop; sy *= pop; }
+    
+    // Voice-driven full-body response
+    C.bodySquash = 1 + lvl * .04;  // chest cavity compression on loud sounds
+    C.shoulderBounce = Voice.accent > .9 ? 4 : 0;
+    C.neckTension = lvl * .5;
+    
     C.nod = Math.max(C.nod * .86, Voice.accent || 0);
     if (Voice.accent > .9 && now - C.lastAcc > 650) { C.lastAcc = now; C.tiltT = (Math.random() - .5) * 5.5; }
     if (!speaking) C.tiltT = 0; C.tilt += (C.tiltT - C.tilt) * .06;
-    if (speaking) { y += -lvl * 3.5 + C.nod * 5; r += C.tilt + C.nod * 1.3; sy *= 1 + lvl * .03 + C.nod * .01; sx *= 1 - lvl * .012; x += Math.sin(t * 2.1) * 1.5; }
+    
+    if (speaking) { 
+      y += -lvl * 3.5 + C.nod * 5; 
+      r += C.tilt + C.nod * 1.3 + C.neckTension * .5; 
+      sy *= C.bodySquash + C.nod * .01; 
+      sx *= 1 - lvl * .012; 
+      x += Math.sin(t * 2.1) * 1.5; 
+      // Shoulder bounce on accent
+      if (C.shoulderBounce) { x += Math.sin(t * 15) * C.shoulderBounce * .3; }
+    }
     else if (prepare) { y += 2.5 + Math.sin(t * 5) * 1; sy *= 1.008; r += Math.sin(t * 3) * .6; }
+    
+    // Breathing micro-motion (always present)
+    C.breathPhase += dt * 2.1;
+    const breathY = Math.sin(C.breathPhase) * .8;
+    const breathScale = 1 + Math.sin(C.breathPhase) * .003;
+    y += breathY;
+    sy *= breathScale;
+    sx *= breathScale;
+    
     const spr = e.s, a = ANCHORS[spr], talking = speaking || prepare;
     if (LIVE) {
       const vid = VID[C.name] || VID[spr];
@@ -198,8 +305,18 @@ export function startLoop() {
         url = wantMouth ? `app://pixie/assets/emotions/mouthless/${spr}.png` : `app://pixie/assets/emotions/${name}.png`; }
       if (url && url !== C.liveUrl) { C.liveUrl = url; LIVE.setSprite(url, C.emoChanged ? 170 : 70); C.emoChanged = false; }
       if (wantMouth) { if (mcv.width !== a.w || mcv.height !== a.h) { mcv.width = a.w; mcv.height = a.h; } paintMouth(mouthState(a, now, dt)); LIVE.setOverlay(mcv); } else LIVE.setOverlay(null);
+      
+      // Coarticulation: update viseme transition
+      const ms = mouthState(a, now, dt);
+      if (ms.viseme !== C.prevViseme) {
+        C.prevViseme = ms.viseme;
+        C.visemeTransition = 0;
+      } else {
+        C.visemeTransition = Math.min(1, C.visemeTransition + dt * 8); // ~125ms transition
+      }
+      
       const rot = Math.sin(t * .7) * .012 + Math.sin(t * .31) * .008 + C.nod * .025 - C.lx * .02, hv = Math.abs(rot - C.prevRot) * 70 + Math.abs(y - C.prevY) * .05; C.prevRot = rot; C.prevY = y; C.hairA += ((1 + Math.min(2.2, hv)) - C.hairA) * .15;
-      LIVE.render({ t, breath: Math.sin(t * 2.1) * .008 + lvl * .004, rot, nod: C.nod + Math.sin(t * 1.3) * .1, yaw: C.lx, pitch: C.ly, jaw: wantMouth ? lvl * .014 : 0, mx: a ? a.cx / 100 : .5, my: a ? a.cy / 100 : .66, blink: blinkVal(now), lookx: C.lx, looky: C.ly, hairAmp: C.hairA, eyes: EYES[spr] || [] });
+      LIVE.render({ t, breath: Math.sin(t * 2.1) * .008 + lvl * .004, rot, nod: C.nod + Math.sin(t * 1.3) * .1, yaw: C.lx, pitch: C.ly, jaw: wantMouth ? lvl * .014 : 0, mx: a ? a.cx / 100 : .5, my: a ? a.cy / 100 : .66, blink: blinkVal(now), lookx: gaze.x, looky: gaze.y, hairAmp: C.hairA, eyes: EYES[spr] || [] });
     } else {
       const hasStage = !!$('sprM'), anchored = hasStage && a;
       if (anchored) { const want = talking; if (want !== C.mouthOn || (want && C.mouthSprite !== spr)) setMouthLayer(want, spr); if (want) applyMouthSvg(mouthState(a, now, dt)); if (C.open) { C.open = false; showSprite(e.s, false); } }

@@ -17,6 +17,144 @@ const hl = (rect, label) => window.aether?.hudSend({ t: 'highlight', rect, label
 const hlClear = () => window.aether?.hudSend({ t: 'clear' });
 export const llmAvailable = () => routeChain('chat').length || routeChain('agent').length;
 
+// ============ RISK-BASED APPROVAL SYSTEM ============
+const RISK_LEVEL = { SAFE: 'safe', CAUTIOUS: 'cautious', RISKY: 'risky' };
+const RISK_TIMEOUT = { safe: 0, cautious: 3000, risky: 45000 };
+const RISK_EMOJI = { safe: '✅', cautious: '⚠️', risky: '⛔' };
+const RISK_EMOTION = { safe: 'happy', cautious: 'thinking', risky: 'curious' };
+
+// Risk frequency tracking for auto-approval learning
+const riskFrequency = new Map();
+const AUTO_APPROVE_THRESHOLD = 3; // Auto-approve after N confirmed executions
+
+// Map each ACT action to its base risk level
+const RISK_MAP = {
+  // Safe (no confirm)
+  open_app: RISK_LEVEL.SAFE, open_url: RISK_LEVEL.SAFE, web_search: RISK_LEVEL.SAFE,
+  scroll: RISK_LEVEL.SAFE, press_keys: RISK_LEVEL.SAFE, media: RISK_LEVEL.SAFE,
+  system: RISK_LEVEL.SAFE, focus_mode: RISK_LEVEL.SAFE, read_clipboard: RISK_LEVEL.SAFE,
+  take_note: RISK_LEVEL.SAFE, set_timer: RISK_LEVEL.SAFE, calculate: RISK_LEVEL.SAFE,
+  compose_text: RISK_LEVEL.SAFE, write_text: RISK_LEVEL.SAFE, screenshot: RISK_LEVEL.SAFE,
+  read_file: RISK_LEVEL.SAFE, list_folder: RISK_LEVEL.SAFE, list_windows: RISK_LEVEL.SAFE,
+  get_sensor: RISK_LEVEL.SAFE, view_logs: RISK_LEVEL.SAFE, scrape_page: RISK_LEVEL.SAFE,
+  extract_links: RISK_LEVEL.SAFE, summarize_page: RISK_LEVEL.SAFE, search_site: RISK_LEVEL.SAFE,
+  bookmark_page: RISK_LEVEL.SAFE, list_calendar: RISK_LEVEL.SAFE, list_todos: RISK_LEVEL.SAFE,
+  control_media: RISK_LEVEL.SAFE, git_status: RISK_LEVEL.SAFE, explain_code: RISK_LEVEL.SAFE,
+  analyze_image: RISK_LEVEL.SAFE,
+
+  // Cautious (quick confirm - 3s timeout, auto-approve on thumbs_up/nod)
+  click_ui: RISK_LEVEL.CAUTIOUS, type_into: RISK_LEVEL.CAUTIOUS, switch_window: RISK_LEVEL.CAUTIOUS,
+  window_action: RISK_LEVEL.CAUTIOUS, snap_window: RISK_LEVEL.CAUTIOUS, open_folder: RISK_LEVEL.CAUTIOUS,
+  compose_email: RISK_LEVEL.CAUTIOUS, find_on_screen: RISK_LEVEL.CAUTIOUS, describe_screen: RISK_LEVEL.CAUTIOUS,
+  describe_window: RISK_LEVEL.CAUTIOUS, describe_here: RISK_LEVEL.CAUTIOUS, read_screen: RISK_LEVEL.CAUTIOUS,
+  ask_screen: RISK_LEVEL.CAUTIOUS, search_selection: RISK_LEVEL.CAUTIOUS, read_selection: RISK_LEVEL.CAUTIOUS,
+  explain_selection: RISK_LEVEL.CAUTIOUS, translate_selection: RISK_LEVEL.CAUTIOUS, rewrite_selection: RISK_LEVEL.CAUTIOUS,
+  summarize_selection: RISK_LEVEL.CAUTIOUS, copy_text: RISK_LEVEL.CAUTIOUS, set_volume: RISK_LEVEL.CAUTIOUS,
+  press_n: RISK_LEVEL.CAUTIOUS, remind_at: RISK_LEVEL.CAUTIOUS, click_here: RISK_LEVEL.CAUTIOUS,
+  open_latest_download: RISK_LEVEL.CAUTIOUS, read_notes: RISK_LEVEL.CAUTIOUS,
+  minimize_window: RISK_LEVEL.CAUTIOUS, maximize_window: RISK_LEVEL.CAUTIOUS, restore_window: RISK_LEVEL.CAUTIOUS,
+  close_window: RISK_LEVEL.CAUTIOUS, create_file: RISK_LEVEL.CAUTIOUS, write_file: RISK_LEVEL.CAUTIOUS,
+  delete_file: RISK_LEVEL.CAUTIOUS, send_email: RISK_LEVEL.CAUTIOUS, create_todo: RISK_LEVEL.CAUTIOUS,
+  create_calendar_event: RISK_LEVEL.CAUTIOUS, play_music: RISK_LEVEL.CAUTIOUS, send_message: RISK_LEVEL.CAUTIOUS,
+  make_call: RISK_LEVEL.CAUTIOUS, screenshot_region: RISK_LEVEL.CAUTIOUS, run_command: RISK_LEVEL.CAUTIOUS,
+  git_commit: RISK_LEVEL.CAUTIOUS, open_editor: RISK_LEVEL.CAUTIOUS, control_light: RISK_LEVEL.CAUTIOUS,
+  set_thermostat: RISK_LEVEL.CAUTIOUS, generate_code: RISK_LEVEL.CAUTIOUS, refactor_code: RISK_LEVEL.CAUTIOUS,
+  write_tests: RISK_LEVEL.CAUTIOUS,
+  add_task: RISK_LEVEL.CAUTIOUS, edit_task: RISK_LEVEL.CAUTIOUS, delete_task: RISK_LEVEL.CAUTIOUS, list_tasks: RISK_LEVEL.SAFE,
+
+  // Risky (full confirm - 45s timeout)
+  // These are handled by getEffectiveRiskLevel overrides
+};
+
+// Helper to determine effective risk level considering args (e.g., window_action close, system lock, media mute)
+function getEffectiveRiskLevel(actionName, args = {}) {
+  const base = RISK_MAP[actionName] || RISK_LEVEL.CAUTIOUS;
+
+  // Risky overrides based on arguments
+  if (actionName === 'window_action' && args.act === 'close') return RISK_LEVEL.RISKY;
+  if (actionName === 'system' && args.what === 'lock') return RISK_LEVEL.RISKY;
+  if (actionName === 'media' && args.key === 'volume_mute') return RISK_LEVEL.RISKY;
+  if (args.then) return RISK_LEVEL.RISKY; // any action with `then` callback
+  if (actionName === 'delete_file') return RISK_LEVEL.RISKY;
+  if (actionName === 'git_commit') return RISK_LEVEL.RISKY;
+  if (actionName === 'run_command') return RISK_LEVEL.RISKY;
+  if (actionName === 'send_email') return RISK_LEVEL.RISKY;
+  if (actionName === 'send_message') return RISK_LEVEL.RISKY;
+  if (actionName === 'make_call') return RISK_LEVEL.RISKY;
+
+  return base;
+}
+
+// Check if action should auto-approve based on frequency
+function shouldAutoApprove(actionName) {
+  const count = riskFrequency.get(actionName) || 0;
+  return count >= AUTO_APPROVE_THRESHOLD;
+}
+
+// Record action execution for learning
+function recordActionExecution(actionName) {
+  const count = (riskFrequency.get(actionName) || 0) + 1;
+  riskFrequency.set(actionName, count);
+}
+
+// Modified ask() with risk level support
+function ask(q, yes, no, riskLevel = RISK_LEVEL.CAUTIOUS) {
+  // Safe actions: no confirmation needed
+  if (riskLevel === RISK_LEVEL.SAFE) {
+    Agent.confirmUI(false);
+    if (yes) yes();
+    return true;
+  }
+
+  // Auto-approve for frequently confirmed cautious actions
+  // Note: We can't check actionName here directly, but callers can bypass
+
+  const timeout = RISK_TIMEOUT[riskLevel] || RISK_TIMEOUT.risky;
+  clearTimeout(P.cur?.t);
+  P.cur = {
+    yes, no, riskLevel,
+    t: setTimeout(() => {
+      P.cur = null;
+      Agent.confirmUI(false);
+      hlClear();
+    }, timeout)
+  };
+
+  // Show risk indicator in caption
+  const emoji = RISK_EMOJI[riskLevel] || '';
+  Agent.caption(`${emoji} ${shorten(q)}`);
+  Agent.confirmUI(true);
+  return say(q, RISK_EMOTION[riskLevel] || 'curious', 0);
+}
+
+// Helper to execute action with risk-based approval
+async function executeWithRisk(actionName, args, executor) {
+  const riskLevel = getEffectiveRiskLevel(actionName, args);
+
+  // Safe actions execute immediately
+  if (riskLevel === RISK_LEVEL.SAFE) {
+    recordActionExecution(actionName);
+    return executor();
+  }
+
+  // Check for auto-approval (cautious actions with high frequency)
+  if (riskLevel === RISK_LEVEL.CAUTIOUS && shouldAutoApprove(actionName)) {
+    recordActionExecution(actionName);
+    return executor();
+  }
+
+  // Need confirmation
+  return new Promise((resolve) => {
+    const q = `Proceed with ${actionName.replace(/_/g, ' ')}?`;
+    ask(q, async () => {
+      recordActionExecution(actionName);
+      resolve(await executor());
+    }, () => {
+      resolve(say('Cancelled.', 'neutral', 2000));
+    }, riskLevel);
+  });
+}
+
 const shorten = t => { const one = (t.match(/^[^.!?~]+[.!?~]?/) || [t])[0].trim(), w = one.split(/\s+/); return w.length > 12 ? w.slice(0, 12).join(' ') + '…' : one; };
 export async function say(text, emo = 'neutral', hold = 5000) {
   if (emo !== 'working') addMessage('assistant', text);   // status chatter ("let me look...") is not saved to the chat
@@ -30,7 +168,6 @@ export async function say(text, emo = 'neutral', hold = 5000) {
 const P = { cur: null };
 export const hasPending = () => !!P.cur;
 export function resolvePending(yes) { const c = P.cur; if (!c) return false; P.cur = null; clearTimeout(c.t); Agent.confirmUI(false); if (yes) c.yes(); else c.no?.(); return true; }
-function ask(q, yes, no) { clearTimeout(P.cur?.t); P.cur = { yes, no, t: setTimeout(() => { P.cur = null; Agent.confirmUI(false); hlClear(); }, 45000) }; Agent.confirmUI(true); return say(q, 'curious', 0); }
 
 // ---------- screen control: find, highlight, confirm, click ----------
 const STOP = /\b(the|a|an|on|button|icon|link|tab|option|menu|item|please|that|this|one|box|field|input|bar|textbox|checkbox|text|of)\b/g;
@@ -55,7 +192,7 @@ function rank(els, target) {
 }
 const kind = t => ({ Button: 'button', Hyperlink: 'link', MenuItem: 'menu item', TabItem: 'tab', CheckBox: 'checkbox', Edit: 'text box', ComboBox: 'dropdown', ListItem: 'item' }[t] || 'item');
 async function llmPick(target, els) {   // when no name matches well, let the AI choose from the real element list
-  if (!llmAvailable() || !els?.length) return null; const list = els.slice(0, 120).map((e, i) => `${i}: ${e.t} "${(e.n || '').slice(0, 40)}"`).join('\n');
+  if (!llmAvailable() || !els?.length) return null; const list = els.slice(0, 120).map((e, i) => `${i}: ${e.t} \"${(e.n || '').slice(0, 40)}\"`).join('\n');
   const o = await completion('agent', [{ role: 'system', content: 'Pick the UI element that best matches what the user wants to click. Reply with ONLY its number, or -1 if none fits.' }, { role: 'user', content: `User wants: "${target}"\nElements:\n${list}` }], 8);
   const n = parseInt((o || '').match(/-?\d+/)?.[0], 10); return Number.isInteger(n) && n >= 0 && n < els.length ? n : null;
 }
@@ -70,8 +207,9 @@ async function clickUI(target, o = {}) {
   let i = 0;
   const doClick = async e => { hlClear(); const k = await nat('click', { x: e.x + e.w / 2, y: e.y + e.h / 2, hwnd: r.hwnd, double: o.double, button: o.button }); if (k.ok && o.then) await o.then(e, r); say(k.ok ? (o.then ? 'Typed it in!' : pick(['Clicked it!', 'Done!', 'Got it!'])) : 'Hmm, that click did not land.', k.ok ? 'success' : 'oops', 3000); };
   const offer = async () => { const e = c[i]; hl(e, e.n);
+    const riskLevel = getEffectiveRiskLevel('click_ui', o);
     await ask(o.verb ? `Type it into this ${kind(e.t)}, ${u()}?` : `Use this ${kind(e.t)}, ${u()}? It says "${e.n.slice(0, 40)}".`, () => doClick(e),
-      async () => { i++; if (i < c.length) { await say('Okay, how about this one?', 'curious', 0); offer(); } else { hlClear(); say("Fine, I'll leave it alone~", 'neutral', 3000); } }); };
+      async () => { i++; if (i < c.length) { await say('Okay, how about this one?', 'curious', 0); offer(); } else { hlClear(); say("Fine, I'll leave it alone~", 'neutral', 3000); } }, riskLevel); };
   return offer();
 }
 async function writeAtCursor(text, enter = false) {
@@ -84,7 +222,7 @@ async function writeAtCursor(text, enter = false) {
 }
 
 // ---------- LLM ----------
-const SYSTEM = () => `You are Pixie, a warm, friendly, cheerful and sweet anime desktop companion and personal agent. You are caring, encouraging and playful, sometimes a little cheeky but always kind and respectful. The user's name is "${u()}". Be genuinely helpful, praise effort, and offer help. ${Agent.compact ? 'Reply in at most 8 words.' : 'Reply with at most two short sentences unless asked to write something.'} Respond ONLY with JSON: {"say":"...","emotion":"${EMOTIONS.join('|')}","actions":[]}. Each action is {"name":...,"args":{...}}. Available actions: open_app{app}, open_url{url}, web_search{query}, click_ui{target}, write_text{text}, compose_text{instruction}, press_keys{combo like ctrl+c}, scroll{direction up|down}, set_timer{minutes,label}, take_note{text}, open_folder{folder}, system{what: minimize_all|lock|battery}, media{key: volume_up|volume_down|volume_mute|media_play|media_next|media_prev}, screenshot{}, focus_mode{}, read_clipboard{}, summarize_selection{}, translate_selection{language}, rewrite_selection{style}, describe_screen{}, calculate{expr}. Only use actions when the user asks you to do something on the computer; chain at most 4. Pick an emotion that matches what you say.`;
+const SYSTEM = () => `You are Pixie, a warm, friendly, cheerful and sweet anime desktop companion and personal agent. You are caring, encouraging and playful, sometimes a little cheeky but always kind and respectful. The user's name is "${u()}". Be genuinely helpful, praise effort, and offer help. ${Agent.compact ? 'Reply in at most 8 words.' : 'Reply with at most two short sentences unless asked to write something.'} Respond ONLY with JSON: {"say":"...","emotion":"${EMOTIONS.join('|')}" ,"actions":[]}. Each action is {"name":...,"args":{...}}. Available actions: open_app{app}, open_url{url}, web_search{query}, click_ui{target}, write_text{text}, compose_text{instruction}, press_keys{combo like ctrl+c}, scroll{direction up|down}, set_timer{minutes,label}, take_note{text}, open_folder{folder}, system{what: minimize_all|lock|battery}, media{key: volume_up|volume_down|volume_mute|media_play|media_next|media_prev}, screenshot{}, focus_mode{}, read_clipboard{}, summarize_selection{}, translate_selection{language}, rewrite_selection{style}, describe_screen{}, calculate{expr}, minimize_window{}, maximize_window{}, restore_window{}, close_window{}, list_windows{}, create_file{path}, read_file{path}, write_file{path,text}, delete_file{path}, list_folder{path}, scrape_page{url}, extract_links{url}, summarize_page{url}, search_site{query,site}, bookmark_page{url}, create_calendar_event{title,date,time}, list_calendar{}, send_email{to,subject,body}, create_todo{text}, list_todos{}, play_music{query}, control_media{action}, send_message{to,body}, make_call{contact}, screenshot_region{rect}, run_command{cmd}, git_status{}, git_commit{message}, open_editor{path}, view_logs{path}, control_light{device,action}, get_sensor{device}, set_thermostat{temp}, analyze_image{url,prompt}, generate_code{spec}, explain_code{code}, refactor_code{code}, write_tests{code}. Only use actions when the user asks you to do something on the computer; chain at most 4. Pick an emotion that matches what you say.`;
 async function completion(slot, messages, max = 400) {
   let chain = routeChain(slot); if (!chain.length) chain = routeChain(slot === 'chat' ? 'agent' : 'chat');
   for (const c of chain) {
@@ -127,7 +265,7 @@ const NUMW = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seve
 const NW = Object.keys(NUMW).join('|');
 function clean(t) {   // tolerate natural speech: "hey pixie, could you please open ..." -> "open ..."; "two minutes" -> "2 minutes"
   let x = t.trim().replace(/^(?:hey |hi |hello |ok |okay )?pixie[,.! ]*/i, '').replace(/^(?:(?:can|could|would|will) you|i (?:want|need|would like) you to|i'?d like you to|go ahead and|let'?s|why don'?t you|just)\s+(?:please\s+)?/i, '').replace(/\s*\bplease\b[.!]?$/i, '').trim();
-  x = x.replace(new RegExp(`\\b(${NW})\\b(?=\\s*(?:seconds?|secs?|minutes?|mins?|hours?|times?|percent|%))`, 'gi'), m => NUMW[m.toLowerCase()]).replace(new RegExp(`\\b(to|at)\\s+(${NW})\\b`, 'gi'), (m, p, n) => `${p} ${NUMW[n.toLowerCase()]}`);
+  x = x.replace(new RegExp(`\b(${NW})\b(?=\s*(?:seconds?|secs?|minutes?|mins?|hours?|times?|percent|%))`, 'gi'), m => NUMW[m.toLowerCase()]).replace(new RegExp(`\b(to|at)\s+(${NW})\b`, 'gi'), (m, p, n) => `${p} ${NUMW[n.toLowerCase()]}`);
   return x;
 }
 const KNOWN = ['notepad', 'calculator', 'paint', 'explorer', 'files', 'terminal', 'settings', 'camera', 'vscode', 'code', 'chrome', 'edge', 'firefox', 'spotify', 'word', 'excel', 'powerpoint', 'taskmanager', 'whatsapp', 'discord', 'teams', 'slack', 'zoom', 'steam', 'store', 'clock', 'calendar', 'mail', 'photos', 'snippingtool', 'youtube', 'google', 'github', 'gmail', 'twitter', 'reddit', 'netflix', 'maps', 'chatgpt', 'instagram', 'facebook', 'linkedin', 'amazon', 'wikipedia', 'drive'];
@@ -139,6 +277,7 @@ function focusMode() { Agent.focusEnd = Date.now() + 25 * 60000; Sound.whoosh();
   return say(`Twenty-five minutes of deep focus, starting now, ${u()}. I'll guard the door~`, 'focused', 3000); }
 function calc(expr) { let e = String(expr).toLowerCase().replace(/(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)/g, '($1/100*$2)').replace(/\bplus\b/g, '+').replace(/\bminus\b/g, '-').replace(/\b(times|multiplied by|x)\b/g, '*').replace(/\b(divided by|over)\b/g, '/').replace(/,/g, '').replace(/\bpercent\b/g, '/100');
   if (!/^[\d\s+\-*/().%]+$/.test(e)) return null; try { const v = Function('"use strict";return (' + e + ')')(); return Number.isFinite(v) ? Math.round(v * 1e6) / 1e6 : null; } catch { return null; } }
+
 export const ACT = {
   open_app: async a => { const app = bestApp(fixApp(a.app)); const r = /\.[a-z]{2,}$/i.test(app) ? await nat('open_url', { url: 'https://' + app }) : await nat('open_app', { app: app.replace(/[^a-z0-9]/g, '') }); return say(r.ok ? pick([`Opening ${app}~`, `${app}, coming right up!`]) : `I don't know how to open ${app} yet.`, r.ok ? 'success' : 'oops', 3000); },
   open_url: async a => { const r = await nat('open_url', { url: a.url }); return say(r.ok ? 'Opening that for you~' : 'That link looks odd.', r.ok ? 'success' : 'oops', 3000); },
@@ -166,7 +305,8 @@ export const ACT = {
   window_action: async a => { const go = async () => { const r = await nat('window', { act: a.act, title: a.title }); say(r.ok ? 'Done!' : 'That did not work.', r.ok ? 'success' : 'oops', 2500); }; if (a.act === 'close') return ask('Close this window?', go, () => say('Okay, leaving it open.', 'neutral', 2500)); return go(); },
   search_selection: async () => { const s = await selection(); if (!s) return say('Highlight some text first, and I will search it!', 'confused', 4000); await nat('web_search', { query: s.text.slice(0, 200) }); return say('Searching that for you!', 'working', 2500); },
   read_selection: async () => { const s = await selection(); if (!s) return say('Highlight some text first, and I will read it!', 'confused', 4000); return say(s.text.replace(/\s+/g, ' ').slice(0, 500), 'neutral', 15000); },
-  press_n: async a => { const hwnd = await tgt(); const n = Math.min(20, Math.max(1, +a.times || 1)); for (let i = 0; i < n; i++) await nat('key', { combo: a.combo, hwnd }); return say('Done!', 'success', 1500); }, write_text: async a => writeAtCursor(String(a.text || ''), !!a.enter),
+  press_n: async a => { const hwnd = await tgt(); const n = Math.min(20, Math.max(1, +a.times || 1)); for (let i = 0; i < n; i++) await nat('key', { combo: a.combo, hwnd }); return say('Done!', 'success', 1500); },
+  write_text: async a => writeAtCursor(String(a.text || ''), !!a.enter),
   compose_text: async a => { if (!llmAvailable()) return needAI(); await say(pick(['Ooh, let me write something nice for you~', "Give me just a moment, I'll make it good!"]), 'thinking', 0);
     const t = await plain(`Write the following. Output only the text itself: ${a.instruction}`, '', 700); return t ? writeAtCursor(t) : say('My brain timed out, try again?', 'sad', 3000); },
   press_keys: async a => { const hwnd = await tgt(); const r = await nat('key', { combo: a.combo, hwnd }); return say(r.ok ? 'Done~' : `I couldn't press ${a.combo}.`, r.ok ? 'success' : 'oops', 2000); },
@@ -178,10 +318,127 @@ export const ACT = {
     const r = await nat('system', a); return say(r.ok ? (a.what === 'lock' ? 'Locking up, goodnight~' : 'Poof, all clear!') : 'That did not work.', r.ok ? 'success' : 'oops', 3000); },
   media: async a => { const r = await nat('key', { key: a.key }); return say(r.ok ? 'Got it~' : 'Could not do that.', r.ok ? 'success' : 'oops', 1800); },
   screenshot: async () => { const r = await nat('screenshot'); return say(r.ok ? 'Click! Saved in Pictures, Pixie.' : 'Screenshot failed.', r.ok ? 'success' : 'oops', 3000); },
-  focus_mode: async () => focusMode(), read_clipboard: async () => { const r = await nat('clipboard_read'); return say(r.text ? `You copied: ${r.text.slice(0, 300)}` : 'Your clipboard is empty, silly.', 'neutral', 7000); },
-  summarize_selection: async () => selTask('Summarize this text in 2-3 short sentences.'), translate_selection: async a => selTask(`Translate this text into ${a.language || 'English'}.`, true),
+  focus_mode: async () => focusMode(),
+  read_clipboard: async () => { const r = await nat('clipboard_read'); return say(r.text ? `You copied: ${r.text.slice(0, 300)}` : 'Your clipboard is empty, silly.', 'neutral', 7000); },
+  summarize_selection: async () => selTask('Summarize this text in 2-3 short sentences.'),
+  translate_selection: async a => selTask(`Translate this text into ${a.language || 'English'}.`, true),
   rewrite_selection: async a => selTask(`Rewrite this text ${a.style ? 'in a ' + a.style + ' style' : 'to be clearer and fix grammar'}.`, true),
-  calculate: async a => { const v = calc(a.expr); return say(v === null ? "Hmm, my math brain couldn't parse that." : `That's ${v}.`, v === null ? 'confused' : 'happy', 4000); }
+  calculate: async a => { const v = calc(a.expr); return say(v === null ? "Hmm, my math brain couldn't parse that." : `That's ${v}.`, v === null ? 'confused' : 'happy', 4000); },
+
+  // ============ NEW: System & Window Management (5) ============
+  minimize_window: async a => { const r = await nat('window', { act: 'min', title: a.title }); return say(r.ok ? 'Minimized!' : 'Could not minimize that window.', r.ok ? 'success' : 'oops', 2500); },
+  maximize_window: async a => { const r = await nat('window', { act: 'max', title: a.title }); return say(r.ok ? 'Maximized!' : 'Could not maximize that window.', r.ok ? 'success' : 'oops', 2500); },
+  restore_window: async a => { const r = await nat('window', { act: 'restore', title: a.title }); return say(r.ok ? 'Restored!' : 'Could not restore that window.', r.ok ? 'success' : 'oops', 2500); },
+  close_window: async a => { const r = await nat('window', { act: 'close', title: a.title }); return say(r.ok ? 'Closed!' : 'Could not close that window.', r.ok ? 'success' : 'oops', 2500); },
+  list_windows: async () => { const r = await nat('scan', { focus: false }); if (!r.ok) return say('Could not list windows.', 'oops', 3000); const titles = (r.els || []).map(e => e.n).filter(Boolean).slice(0, 20); return say(titles.length ? 'Open windows: ' + titles.join(', ') : 'No windows found.', 'neutral', 8000); },
+
+  // ============ NEW: File Operations (5) ============
+  create_file: async a => { const r = await nat('create_file', { path: a.path }); return say(r.ok ? `Created ${a.path}~` : 'Could not create file.', r.ok ? 'success' : 'oops', 3000); },
+  read_file: async a => { const r = await nat('read_file', { path: a.path }); return say(r.ok ? `Contents of ${a.path}: ${r.text?.slice(0, 500)}` : 'Could not read file.', r.ok ? 'neutral' : 'oops', 8000); },
+  write_file: async a => { const r = await nat('write_file', { path: a.path, text: a.text }); return say(r.ok ? `Wrote to ${a.path}~` : 'Could not write file.', r.ok ? 'success' : 'oops', 3000); },
+  delete_file: async a => { const r = await nat('delete_file', { path: a.path }); return say(r.ok ? `Deleted ${a.path}` : 'Could not delete file.', r.ok ? 'success' : 'oops', 3000); },
+  list_folder: async a => { const r = await nat('list_folder', { path: a.path || 'desktop' }); if (!r.ok) return say('Could not list folder.', 'oops', 3000); const items = (r.items || []).slice(0, 30).join(', '); return say(items ? `In ${a.path || 'Desktop'}: ${items}` : 'Folder is empty.', 'neutral', 8000); },
+
+  // ============ NEW: Web & Search (5) ============
+  scrape_page: async a => { if (!llmAvailable()) return needAI(); await say('Fetching page...', 'working', 0); const r = await window.aether.fetch({ url: a.url, timeout: 15000 }); if (!r.ok) return say('Could not fetch page.', 'oops', 3000); const out = await plain('Extract the main article/content from this HTML. Output only the readable text, no HTML tags, max 2000 chars.', r.text, 1500); return out ? say(out.slice(0, 600), 'neutral', 12000) : say('Could not extract content.', 'oops', 3000); },
+  extract_links: async a => { if (!llmAvailable()) return needAI(); await say('Extracting links...', 'working', 0); const r = await window.aether.fetch({ url: a.url, timeout: 15000 }); if (!r.ok) return say('Could not fetch page.', 'oops', 3000); const out = await plain('Extract all unique URLs from this HTML. Output one per line, max 50.', r.text, 1000); return out ? say(out.slice(0, 600), 'neutral', 12000) : say('No links found.', 'oops', 3000); },
+  summarize_page: async a => { if (!llmAvailable()) return needAI(); await say('Summarizing page...', 'thinking', 0); const r = await window.aether.fetch({ url: a.url, timeout: 15000 }); if (!r.ok) return say('Could not fetch page.', 'oops', 3000); const out = await plain('Summarize this page in 3-4 sentences. Focus on key points.', r.text, 500); return out ? say(out, 'happy', 10000) : say('Could not summarize.', 'oops', 3000); },
+  search_site: async a => { await nat('web_search', { query: `site:${a.site} ${a.query}` }); return say(`Searching ${a.site} for "${a.query}"~`, 'thinking', 3000); },
+  bookmark_page: async a => { const r = await nat('bookmark', { url: a.url }); return say(r.ok ? 'Bookmarked!' : 'Could not bookmark.', r.ok ? 'success' : 'oops', 3000); },
+
+  // ============ NEW: Productivity (5) ============
+  create_calendar_event: async a => { const r = await nat('calendar_create', { title: a.title, date: a.date, time: a.time }); return say(r.ok ? `Created event "${a.title}" for ${a.date} at ${a.time}` : 'Could not create event.', r.ok ? 'success' : 'oops', 4000); },
+  list_calendar: async () => { const r = await nat('calendar_list'); return say(r.events?.length ? 'Upcoming: ' + r.events.slice(0, 10).map(e => `${e.title} (${e.date} ${e.time})`).join('; ') : 'No upcoming events.', 'neutral', 8000); },
+  send_email: async a => { const r = await nat('send_email', { to: a.to, subject: a.subject, body: a.body }); return say(r.ok ? 'Email sent!' : 'Could not send email.', r.ok ? 'success' : 'oops', 4000); },
+  create_todo: async a => { const r = await nat('todo_create', { text: a.text }); return say(r.ok ? 'Todo added!' : 'Could not add todo.', r.ok ? 'success' : 'oops', 3000); },
+  list_todos: async () => { const r = await nat('todo_list'); return say(r.todos?.length ? 'Your todos: ' + r.todos.slice(0, 15).map(t => t.text).join('; ') : 'No todos.', 'neutral', 8000); },
+
+  // ============ NEW: Media & Communication (5) ============
+  play_music: async a => { const r = await nat('play_music', { query: a.query }); return say(r.ok ? `Playing ${a.query}~` : 'Could not play music.', r.ok ? 'success' : 'oops', 4000); },
+  control_media: async a => { const r = await nat('media', { key: a.action }); return say(r.ok ? 'Done!' : 'Could not control media.', r.ok ? 'success' : 'oops', 2000); },
+  send_message: async a => { const r = await nat('send_message', { to: a.to, body: a.body }); return say(r.ok ? 'Message sent!' : 'Could not send message.', r.ok ? 'success' : 'oops', 4000); },
+  make_call: async a => { const r = await nat('make_call', { contact: a.contact }); return say(r.ok ? `Calling ${a.contact}...` : 'Could not make call.', r.ok ? 'success' : 'oops', 4000); },
+  screenshot_region: async a => { const r = await nat('screenshot', { rect: a.rect }); return say(r.ok ? 'Screenshot saved!' : 'Could not take screenshot.', r.ok ? 'success' : 'oops', 3000); },
+
+  // ============ NEW: Development (5) ============
+  run_command: async a => { const r = await nat('run_command', { cmd: a.cmd }); return say(r.ok ? `Output: ${r.output?.slice(0, 400)}` : `Error: ${r.error}`, r.ok ? 'success' : 'oops', 5000); },
+  git_status: async a => { const r = await nat('git_status', { path: a.path || '.' }); return say(r.ok ? r.output : 'Not a git repo.', r.ok ? 'neutral' : 'oops', 8000); },
+  git_commit: async a => { const r = await nat('git_commit', { message: a.message, path: a.path || '.' }); return say(r.ok ? 'Committed!' : 'Could not commit.', r.ok ? 'success' : 'oops', 4000); },
+  open_editor: async a => { const r = await nat('open_app', { app: 'code' }); if (r.ok && a.path) { await new Promise(z => setTimeout(z, 500)); await nat('paste', { text: a.path }); await nat('key', { combo: 'enter' }); } return say(r.ok ? 'Opened editor!' : 'Could not open editor.', r.ok ? 'success' : 'oops', 3000); },
+  view_logs: async a => { const r = await nat('read_file', { path: a.path }); return say(r.ok ? r.text?.slice(0, 1000) : 'Could not read logs.', r.ok ? 'neutral' : 'oops', 8000); },
+
+  // ============ NEW: Smart Home / IoT (3) ============
+  control_light: async a => { const r = await nat('iot_light', { device: a.device, action: a.action }); return say(r.ok ? `Light ${a.action}` : 'Could not control light.', r.ok ? 'success' : 'oops', 3000); },
+  get_sensor: async a => { const r = await nat('iot_sensor', { device: a.device }); return say(r.ok ? `${a.device}: ${r.value}` : 'Could not read sensor.', r.ok ? 'neutral' : 'oops', 4000); },
+  set_thermostat: async a => { const r = await nat('iot_thermostat', { temp: a.temp }); return say(r.ok ? `Set to ${a.temp}°` : 'Could not set thermostat.', r.ok ? 'success' : 'oops', 3000); },
+
+  // ============ NEW: AI-Powered (5) ============
+  analyze_image: async a => { if (!routeChain('vision').length) return needVision(); await say('Analyzing image...', 'thinking', 0); const r = await askVision(a.prompt || 'Describe this image in detail.', { rect: a.rect }); return r ? say(r.text, 'happy', 10000) : say('Could not analyze.', 'oops', 3000); },
+  generate_code: async a => { if (!llmAvailable()) return needAI(); await say('Generating code...', 'thinking', 0); const out = await plain(`Write clean, complete code for: ${a.spec}. Output only the code.`, '', 2000); return out ? writeAtCursor(out) : say('Could not generate.', 'oops', 3000); },
+  explain_code: async a => { if (!llmAvailable()) return needAI(); await say('Explaining code...', 'thinking', 0); const out = await plain(`Explain this code simply in 3-4 sentences.`, a.code, 700); return out ? say(out, 'neutral', 10000) : say('Could not explain.', 'oops', 3000); },
+  refactor_code: async a => { if (!llmAvailable()) return needAI(); await say('Refactoring...', 'thinking', 0); const out = await plain(`Refactor this code to be cleaner and more maintainable. Output only the improved code.`, a.code, 2000); return out ? writeAtCursor(out) : say('Could not refactor.', 'oops', 3000); },
+  write_tests: async a => { if (!llmAvailable()) return needAI(); await say('Writing tests...', 'thinking', 0); const out = await plain(`Write unit tests for this code. Output only the test code.`, a.code, 2000); return out ? writeAtCursor(out) : say('Could not write tests.', 'oops', 3000); },
+
+  
+  // ============ NEW: Voice-Activated Task Management ============
+  add_task: async a => {
+    const phrase = a.phrase;
+    const actionType = a.actionType;
+    const actionValue = a.actionValue;
+    if (!phrase || !actionType || !actionValue) {
+      return say('I need a phrase, action type, and value to create the task.', 'confused', 4000);
+    }
+    // Check if phrase already exists
+    const existing = (S.macros || []).find(m => m.phrase?.toLowerCase() === phrase.toLowerCase());
+    if (existing) {
+      return say(`There's already a task called "${phrase}". Say "edit task ${phrase}" to change it.`, 'worried', 5000);
+    }
+    const newMacro = { phrase, action: { type: actionType, value: actionValue } };
+    S.macros = [...(S.macros || []), newMacro];
+    save();
+    return say(`Created task "${phrase}"! When you say that, I'll ${actionType} ${actionValue}.`, 'success', 5000);
+  },
+  edit_task: async a => {
+    const phrase = a.phrase;
+    const actionType = a.actionType;
+    const actionValue = a.actionValue;
+    if (!phrase) {
+      return say('Which task would you like to edit? Say "edit task [name]".', 'confused', 4000);
+    }
+    const idx = (S.macros || []).findIndex(m => m.phrase?.toLowerCase() === phrase.toLowerCase());
+    if (idx === -1) {
+      return say(`I couldn't find a task called "${phrase}".`, 'worried', 4000);
+    }
+    if (actionType && actionValue) {
+      S.macros[idx].action = { type: actionType, value: actionValue };
+    } else if (actionType || actionValue) {
+      return say('Please provide both the action type and value to edit.', 'confused', 4000);
+    }
+    save();
+    return say(`Updated task "${phrase}"!`, 'success', 4000);
+  },
+  delete_task: async a => {
+    const phrase = a.phrase;
+    if (!phrase) {
+      return say('Which task would you like to delete? Say "delete task [name]".', 'confused', 4000);
+    }
+    const idx = (S.macros || []).findIndex(m => m.phrase?.toLowerCase() === phrase.toLowerCase());
+    if (idx === -1) {
+      return say(`I couldn't find a task called "${phrase}".`, 'worried', 4000);
+    }
+    const removed = S.macros.splice(idx, 1)[0];
+    save();
+    return say(`Deleted task "${removed.phrase}".`, 'success', 4000);
+  },
+  list_tasks: async () => {
+    const macros = S.macros || [];
+    if (!macros.length) {
+      return say('You have no custom tasks yet. Say "add task [name] that [action]" to create one!', 'happy', 6000);
+    }
+    const list = macros.map(m => `"${m.phrase}" -> ${m.action.type} ${m.action.value}`).join('; ');
+    return say(`Your custom tasks: ${list}`, 'neutral', 10000);
+  },
+
 };
 for (const k of Object.keys(ACT)) { const f = ACT[k]; ACT[k] = async a => { if (!['focus_mode', 'click_ui', 'write_text', 'compose_text'].includes(k)) setEmotion('working'); return f(a); }; }
 export async function runActions(list) { for (const a of (list || []).slice(0, 4)) { const f = ACT[a?.name]; if (f) await f(a.args || {}); } }
@@ -262,11 +519,71 @@ const COMMANDS = [
   [/\b(you'?re|you are) (so |very )?(cute|pretty|adorable|amazing|the best|nice|kind|great)\b|\bi love you\b/, () => { burst('hearts', 12); Sound.chime(); return say(pick(["Aww, you're making me blush! Thank you!", 'That is so sweet, ' + u() + '! You are wonderful too!']), 'blushing', 6000); }],
   [/\bhow are you\b|\bhow'?s it going\b/, () => say(`I'm great, especially now that you're here, ${u()}! How is your day going?`, 'happy')],
   [/\b(i had a (bad|rough|hard) day|i'?m having a (bad|rough|hard) day)\b/, () => say(`Oh no, I'm sorry, ${u()}. I'm here with you. Want to take a little break together?`, 'worried', 7000)],
-  [/\b(good|great|awesome|fine|wonderful) (day|today)\b|\bi'?m (good|great|happy|fine)\b/, () => { burst('sparkles', 10); return say('Yay, I love hearing that! Let us make it even better!', 'joyful'); }],
+  [/\b(good|great|awesome|fine|wonderful) (day|today)\b|i'?m (good|great|happy|fine)\b/, () => { burst('sparkles', 10); return say('Yay, I love hearing that! Let us make it even better!', 'joyful'); }],
   [/^(?:call me|my name is|i am called|you can call me)\s+([a-z][a-z' ]{1,20})$/, m => { S.user = m[1].trim().replace(/\b\w/g, c => c.toUpperCase()); save(); return say(`Nice to meet you, ${S.user}! I'll call you that from now on.`, 'excited'); }],
   [/^(hi|hello|hey|yaho|good (morning|afternoon|evening))\b/, () => { react('greeting', 3500); return say(pick([`Hi ${u()}! So good to see you!`, `Hello ${u()}! What can I do for you?`]), 'greeting'); }],
   [/\bwhat can you do\b|^help$/, () => say('I can open apps and sites, search, click buttons, type for you, scroll, set timers, take notes, and summarize or translate your selected text. Just say hello Pixie!', 'happy', 9000)],
-  [/^(?:what is|what's|calculate|compute|how much is)\s+(.+?)\??$/, m => { const v = calc(m[1]); return v === null ? null : ACT.calculate({ expr: m[1] }); }]
+  [/^(?:what is|what's|calculate|compute|how much is)\s+(.+?)\??$/, m => { const v = calc(m[1]); return v === null ? null : ACT.calculate({ expr: m[1] }); }],
+
+  // ============ NEW: System & Window Management ============
+  [/^(?:please )?minimi[sz]e (?:the |my )?window\b|^minimi[sz]e window$/, () => ACT.minimize_window({})],
+  [/^(?:please )?maximi[sz]e (?:the |my )?window\b|^maximi[sz]e window$/, () => ACT.maximize_window({})],
+  [/^(?:please )?restore (?:the |my )?window\b|^restore window$/, () => ACT.restore_window({})],
+  [/^(?:please )?close (?:the |my )?window\b|^close window$/, () => ACT.close_window({})],
+  [/\blist (?:open |all )?windows\b|\bwhat windows (?:are )?open\b/, () => ACT.list_windows()],
+
+  // ============ NEW: File Operations ============
+  [/^(?:please )?create (?:a |new )?file (.+)$/, m => ACT.create_file({ path: m[1] })],
+  [/^(?:please )?read file (.+)$|\bread (.+) file\b/, m => ACT.read_file({ path: m[1] })],
+  [/^(?:please )?write (?:to |in )?file (.+?) (?:with |:)(.+)$/, m => ACT.write_file({ path: m[1], text: m[2] })],
+  [/^(?:please )?delete file (.+)$|\bremove file (.+)\b/, m => ACT.delete_file({ path: m[1] })],
+  [/^(?:please )?list (?:files in |folder )?(.+)$|\bwhat'?s in (.+)\b/, m => ACT.list_folder({ path: m[1] })],
+
+  // ============ NEW: Web & Search ============
+  [/^(?:please )?scrape (.+)$/, m => ACT.scrape_page({ url: m[1] })],
+  [/^(?:please )?extract links from (.+)$/, m => ACT.extract_links({ url: m[1] })],
+  [/^(?:please )?summarize (.+)$/, m => ACT.summarize_page({ url: m[1] })],
+  [/^(?:please )?search (.+) on (.+)$/, m => ACT.search_site({ query: m[1], site: m[2] })],
+  [/^(?:please )?bookmark (.+)$/, m => ACT.bookmark_page({ url: m[1] })],
+
+  // ============ NEW: Productivity ============
+  [/^(?:please )?create (?:calendar |)(?:event|meeting) (.+?) (?:on |for )(.+?) (?:at |)(.+)$/, m => ACT.create_calendar_event({ title: m[1], date: m[2], time: m[3] })],
+  [/\blist (?:calendar|events|schedule)\b/, () => ACT.list_calendar()],
+  [/^(?:please )?send email to (.+?) (?:about |with subject |)(.+)?$/, m => ACT.send_email({ to: m[1], subject: m[2] || '', body: m[2] || '' })],
+  [/^(?:please )?add todo (.+)$|\bcreate todo (.+)\b/, m => ACT.create_todo({ text: m[1] })],
+  [/\blist todos\b|\bmy todos\b/, () => ACT.list_todos()],
+
+  // ============ NEW: Media & Communication ============
+  [/^(?:please )?play (.+) (?:music|song|track)\b/, m => ACT.play_music({ query: m[1] })],
+  [/\b(play|pause|next|previous|skip) (?:the )?(music|song|track|media)\b/, m => ACT.control_media({ action: m[1] === 'next' ? 'media_next' : m[1] === 'previous' ? 'media_prev' : m[1] === 'skip' ? 'media_next' : 'media_play' })],
+  [/^(?:please )?send (?:a |)(?:message|text) to (.+?) (?:saying |)(.+)$/, m => ACT.send_message({ to: m[1], body: m[2] })],
+  [/^(?:please )?call (.+)$/, m => ACT.make_call({ contact: m[1] })],
+  [/^(?:please )?screenshot (?:region|area) (.+)$/, m => { const coords = m[1].split(/\s+/).map(Number); return ACT.screenshot_region({ rect: { x: coords[0], y: coords[1], w: coords[2], h: coords[3] } }); }],
+
+  // ============ NEW: Development ============
+  [/^(?:please )?run (?:command|cmd) (.+)$/, m => ACT.run_command({ cmd: m[1] })],
+  [/\bgit status\b/, m => ACT.git_status({ path: m[1] })],
+  [/^(?:please )?git commit (.+)$/, m => ACT.git_commit({ message: m[1] })],
+  [/^(?:please )?open (?:editor|vscode|code)(?: at (.+))?$/, m => ACT.open_editor({ path: m[1] })],
+  [/^(?:please )?view logs (.+)$/, m => ACT.view_logs({ path: m[1] })],
+
+  // ============ NEW: Smart Home / IoT ============
+  [/^(?:please )?turn (on|off) (?:the |)(.+) light\b/, m => ACT.control_light({ device: m[2], action: m[1] })],
+  [/^(?:please )?(?:get|read) (?:the |)(.+) sensor\b/, m => ACT.get_sensor({ device: m[1] })],
+  [/^(?:please )?set (?:the |)(?:thermostat|temperature) to (\d+)\b/, m => ACT.set_thermostat({ temp: +m[1] })],
+
+  // ============ NEW: AI-Powered ============
+  [/^(?:please )?analyze (?:this |the )?image (.+)$/, m => ACT.analyze_image({ url: m[1] })],
+  [/^(?:please )?generate code (?:for |)(.+)$/, m => ACT.generate_code({ spec: m[1] })],
+  [/^(?:please )?explain (?:this |the )?code (.+)$/, m => ACT.explain_code({ code: m[1] })],
+  [/^(?:please )?refactor (?:this |the )?code (.+)$/, m => ACT.refactor_code({ code: m[1] })],
+  [/^(?:please )?write tests (?:for |)(.+)$/, m => ACT.write_tests({ code: m[1] })],
+
+  // ============ NEW: Voice-Activated Task Management ============
+  [/^(?:please )?add task (.+?) that (.+?) (.+)$/, m => ACT.add_task({ phrase: m[1].trim(), actionType: m[2].trim(), actionValue: m[3].trim() })],
+  [/^(?:please )?edit task (.+?) to (.+?) (.+)$/, m => ACT.edit_task({ phrase: m[1].trim(), actionType: m[2].trim(), actionValue: m[3].trim() })],
+  [/^(?:please )?delete task (.+)$/, m => ACT.delete_task({ phrase: m[1].trim() })],
+  [/^(?:please )?list tasks?\b|\bshow (?:my |)tasks?\b/, () => ACT.list_tasks()],
 ];
 function offline(text) { const t = text.toLowerCase().replace(/[?!.,]+$/g, '').trim(); for (const [re, fn] of COMMANDS) { const m = re.exec(t); if (m) return () => fn(m, t); } return null; }
 const dsc = (a, b) => dice(a.toLowerCase(), b.toLowerCase());
