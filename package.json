@@ -19,16 +19,37 @@
     "electron-builder": "^25.1.8"
   },
   "build": {
-    "electronDownload": { "cache": "C:\\Users\\raypr\\.gemini\\antigravity\\scratch\\electron-cache" },
+    "electronDownload": {
+      "cache": "/tmp/electron-cache"
+    },
     "appId": "com.pixie.companion",
     "productName": "Pixie",
-    "directories": { "output": "dist", "buildResources": "build" },
-    "files": ["main.js", "preload.js", "renderer/**/*", "assets/**/*", "package.json"],
-    "win": { 
-      "target": [ { "target": "zip", "arch": ["x64"] } ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "sign": false,
       "verifyUpdateCodeSignature": false,
-      "executableName": "Pixie"
+      "forceCodeSigning": false,
+      "signAndEditExecutable": false,
+      "executableName": "Pixie",
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -38,7 +59,6 @@
       "shortcutName": "Pixie",
       "artifactName": "Pixie-Setup-${version}.${ext}"
     },
-    "forceCodeSigning": false,
     "extraMetadata": {
       "version": "1.0.0"
     }
